@@ -84,8 +84,9 @@ def candidate(score):
 
 
 @pytest.mark.parametrize("lose_restore_response", [False, True])
+@pytest.mark.parametrize("host_budget", [False, True], ids=["aggregate_only", "host_budget"])
 def test_real_native_checkpoint_continues_without_regrading_or_refill(
-    tmp_path, monkeypatch, lose_restore_response
+    tmp_path, monkeypatch, lose_restore_response, host_budget
 ):
     import docker
     import requests
@@ -96,6 +97,9 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
     from sforge.harness.config import SForgeConfig
 
     name = "checkpoint-native-" + uuid.uuid4().hex[:10]
+    monkeypatch.setenv("SFORGE_JUDGE_HOST_SLOT_FILE", str(tmp_path / "slots.json"))
+    monkeypatch.setenv("SFORGE_JUDGE_HOST_OWNER_FILE", str(tmp_path / "owners.json"))
+    monkeypatch.setenv("SFORGE_JUDGE_HOST_MEMORY_FILE", str(tmp_path / "memory.json"))
     destination_run = name + "-branch"
     docker_client = docker.from_env()
     base = docker_client.images.get("python:3.12-slim")
@@ -122,6 +126,8 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
         log_dir=tmp_path / "source",
         judge_cpu_limit=1,
         judge_mem_limit="256m",
+        judge_host_capacity=2 if host_budget else None,
+        judge_host_memory_capacity="512m" if host_budget else None,
     )
     source = native.create_app(config, checkpoints=True)
 
