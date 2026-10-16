@@ -151,6 +151,17 @@ if [ "$LIST_MODE" -eq 1 ]; then
     if [ "$BEST_SCORE" != "N/A" ] && [ "$BEST_SCORE" != "null" ]; then
         echo "  Best score: $BEST_SCORE"
     fi
+    if echo "$HIST" | jq -e '.agent_submission_availability != null' >/dev/null; then
+        echo "$HIST" | jq -r '.agent_submission_availability |
+            "  Agent submission limits (server snapshot):",
+            ("  Remaining submissions: " + (if .remaining_submissions == null then "unlimited" else (.remaining_submissions | tostring) end)),
+            (if .remaining_submissions == 0 then "  Submission budget exhausted."
+             elif .cooldown_remaining_seconds > 0 then "  Cooldown: wait " + (.cooldown_remaining_seconds | tostring) + "s from this read."
+             else "  Cooldown: ready at this read." end),
+            "  Read-only; does not reserve or guarantee submission admission."'
+    else
+        echo "  Current submission limits unavailable from this server."
+    fi
     echo "========================================"
     echo ""
     if [ "$COUNT" -gt 0 ]; then
