@@ -16,9 +16,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from docker.utils import parse_bytes
+
+import fcntl
+import os
 import json
 import logging
 import secrets
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 import threading
 import time
 import uuid
@@ -50,6 +58,10 @@ from sforge.harness.task_spec import TaskSpec, load_all_tasks
 logger = logging.getLogger("sforge.judge_server")
 
 GAME_SERVER_APP_PATH = Path(__file__).parent / "game_server_app.py"
+
+
+class JudgeCapacityExceeded(Exception):
+    pass
 
 
 class SubmissionBudgetExceeded(Exception):
@@ -183,12 +195,273 @@ class GameSessionState:
     last_active: float = field(default_factory=time.time)
 
 
+def submission_history_entry(submission_id: str, task_id: str, round_id: str | None,
+                             report_dict: dict | None, error: str | None, status: str) -> dict:
+    entry: dict[str, Any] = {
+        "type": "submission",
+        "status": status,
+        "submission_id": submission_id,
+        "task_id": task_id,
+        "round": round_id,
+    }
+    if report_dict:
+        entry["pass_rate"] = report_dict.get("pass_rate", 0.0)
+        entry["score"] = report_dict.get("score")
+        entry["passed"] = report_dict.get("passed", 0)
+        entry["failed"] = report_dict.get("failed", 0)
+        entry["total_tests"] = report_dict.get("total_tests", 0)
+        entry["valid"] = report_dict.get("valid", True)
+        entry["summary"] = report_dict.get("summary")
+        for key in ("timed_out", "runtime_seconds"):
+            if key in report_dict:
+                entry[key] = report_dict[key]
+    if error:
+        entry["error"] = error
+    return entry
+
+
+#: Host-wide slot file. Every launcher process on this machine contends for the
+#: same file, so the total number of concurrently running judges is bounded once
+#: instead of once per process.
+JUDGE_HOST_SLOT_FILE = os.environ.get(
+    "SFORGE_JUDGE_HOST_SLOT_FILE", "/tmp/sforge-judge-host-slots.json")
+JUDGE_HOST_MEMORY_FILE = os.environ.get(
+    "SFORGE_JUDGE_HOST_MEMORY_FILE", "/tmp/sforge-judge-host-memory.json")
+JUDGE_HOST_OWNER_FILE = os.environ.get(
+    "SFORGE_JUDGE_HOST_OWNER_FILE", "/tmp/sforge-judge-host-owners.json")
+#: Default host-wide total. Chosen so several launchers share one machine budget.
+JUDGE_HOST_CAPACITY = 8
+
+
+class HostJudgeCapacity:
+    """Cross-process judge slot budget backed by an flock-guarded file.
+
+    A per-process pool multiplies with the number of launcher processes; this is the
+    bound that actually limits the host. The first writer fixes the capacity.
+    A dead launcher does not prove its judge containers stopped, so slots remain
+    reserved until explicit release or backend-confirmed cleanup.
+    """
+
+    def __init__(
+        self, capacity: int, path: str | None = None, owner_path: str | None = None,
+    ) -> None:
+        self.capacity = max(1, int(capacity))
+        self.path = Path(path or os.environ.get("SFORGE_JUDGE_HOST_SLOT_FILE", JUDGE_HOST_SLOT_FILE))
+        self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        if owner_path is not None:
+            self._owner_path = Path(owner_path)
+        elif path is not None:
+            self._owner_path = self.path.with_suffix(self.path.suffix + ".owners")
+        else:
+            self._owner_path = Path(
+                os.environ.get("SFORGE_JUDGE_HOST_OWNER_FILE", JUDGE_HOST_OWNER_FILE)
+            )
+
+    def _read(self) -> dict:
+        try:
+            state = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {"version": 1, "capacity": self.capacity, "holders": {}}
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Cannot read judge host capacity state") from exc
+        if (not isinstance(state, dict) or state.get("version") != 1
+                or type(state.get("capacity")) is not int or state["capacity"] < 1
+                or not isinstance(state.get("holders"), dict)
+                or any(
+                    not isinstance(k, str)
+                    or not (
+                        isinstance(v, (int, float))
+                        or (
+                            isinstance(v, dict)
+                            and isinstance(v.get("acquired_at"), (int, float))
+                            and (v.get("owner_id") is None or isinstance(v.get("owner_id"), str))
+                            and type(v.get("units", 1)) is int
+                            and v.get("units", 1) >= 1
+                        )
+                    )
+                    for k, v in state["holders"].items()
+                )):
+            raise RuntimeError("Invalid judge host capacity state; explicit recovery required")
+        return state
+
+    def _write(self, state: dict) -> None:
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(self.path)
+
+    def _read_owners(self) -> dict[str, str]:
+        try:
+            state = json.loads(self._owner_path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Cannot read judge host owner state") from exc
+        owners = state.get("owners") if isinstance(state, dict) else None
+        if (
+            not isinstance(state, dict)
+            or state.get("version") != 1
+            or not isinstance(owners, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in owners.items())
+        ):
+            raise RuntimeError("Invalid judge host owner state; explicit recovery required")
+        return owners
+
+    def _write_owners(self, owners: dict[str, str]) -> None:
+        tmp = self._owner_path.with_suffix(self._owner_path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"version": 1, "owners": owners}))
+        tmp.replace(self._owner_path)
+
+    @staticmethod
+    def _holder_units(holder: float | dict) -> int:
+        return holder.get("units", 1) if isinstance(holder, dict) else 1
+
+    def try_acquire(
+        self, token: str, owner_id: str | None = None, *, units: int = 1,
+    ) -> bool:
+        if type(units) is not int or units < 1:
+            raise ValueError("Judge host capacity units must be a positive integer")
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                state = self._read()
+                if state["capacity"] != self.capacity:
+                    raise RuntimeError("Judge host capacity configuration mismatch")
+                holders = state["holders"]
+                owners = self._read_owners()
+                current = holders.get(token)
+                if current is not None:
+                    current_owner = (
+                        current.get("owner_id") if isinstance(current, dict)
+                        else owners.get(token)
+                    )
+                    if self._holder_units(current) != units or current_owner != owner_id:
+                        raise RuntimeError("Judge host capacity holder identity mismatch")
+                used = sum(self._holder_units(holder) for holder in holders.values())
+                if current is not None or used + units <= state["capacity"]:
+                    holders[token] = (
+                        {"acquired_at": time.time(), "owner_id": owner_id, "units": units}
+                        if units != 1 else time.time()
+                    )
+                    if owner_id is not None:
+                        owners[token] = owner_id
+                    else:
+                        owners.pop(token, None)
+                    self._write(state)
+                    self._write_owners(owners)
+                    return True
+                return False
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def release(self, token: str) -> None:
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                state = self._read()
+                owners = self._read_owners()
+                state["holders"].pop(token, None)
+                owners.pop(token, None)
+                self._write(state)
+                self._write_owners(owners)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _owner_is_alive(token: str) -> bool:
+        owner, separator, _ = token.partition(":")
+        if not separator:
+            return True
+        try:
+            pid = int(owner)
+        except ValueError:
+            return True
+        if pid < 1:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def reconcile_stale_holders(
+        self, cleanup: Callable[[str, str | None], bool],
+    ) -> list[str]:
+        """Release dead owners only after their backend resources are gone."""
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                state = self._read()
+                if state["capacity"] != self.capacity:
+                    raise RuntimeError("Judge host capacity configuration mismatch")
+                snapshot = dict(state["holders"])
+                owner_snapshot = self._read_owners()
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+        reconciled = []
+        for token, holder in sorted(snapshot.items()):
+            if self._owner_is_alive(token):
+                continue
+            owner_id = (
+                holder.get("owner_id") if isinstance(holder, dict)
+                else owner_snapshot.get(token)
+            )
+            try:
+                cleaned = cleanup(token, owner_id)
+            except Exception:
+                logger.exception("Could not clean stale judge slot %s", token)
+                continue
+            if not cleaned:
+                continue
+            with open(self._lock_path, "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    state = self._read()
+                    if state["holders"].get(token) != holder:
+                        continue
+                    owners = self._read_owners()
+                    state["holders"].pop(token)
+                    owners.pop(token, None)
+                    self._write(state)
+                    self._write_owners(owners)
+                    reconciled.append(token)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        return reconciled
+
+
 # --- Server state ---
 
 
 class JudgeState:
-    def __init__(self, config: SForgeConfig):
+    def __init__(
+        self, config: SForgeConfig, *,
+        backend_factory: Callable[[SForgeConfig], ContainerBackend] | None = None,
+    ):
+        if config.judge_max_concurrent < 1 or config.judge_max_pending < 0:
+            raise ValueError("judge_max_concurrent must be >= 1 and judge_max_pending >= 0")
+        if config.judge_max_outstanding_per_run is not None and config.judge_max_outstanding_per_run < 1:
+            raise ValueError("judge_max_outstanding_per_run must be >= 1 or unset")
+        if config.judge_host_capacity is not None and (
+            type(config.judge_host_capacity) is not int or config.judge_host_capacity < 1
+        ):
+            raise ValueError("judge_host_capacity must be a positive integer or unset")
         self.config = config
+        # Synchronous failures release while holding this same admission lock.
+        self._admission_lock = threading.RLock()
+        self._closed = False
+        self._outstanding_by_run: dict[tuple[str, str], int] = {}
+        self._capacity = threading.BoundedSemaphore(
+            config.judge_max_concurrent + config.judge_max_pending
+        )
+        self._executor = ThreadPoolExecutor(
+            max_workers=config.judge_max_concurrent, thread_name_prefix="sforge-judge"
+        )
         self.admin_secret = get_admin_secret(config.log_dir)
         self.tasks: dict[str, TaskSpec] = {}
         self.submissions: dict[str, dict] = {}  # submission_id -> {status, report, ...}
@@ -200,13 +473,43 @@ class JudgeState:
         self._game_lock = threading.Lock()
         self._history_lock = threading.Lock()
         self._tokens_lock = threading.Lock()
-        self.backend = create_backend_from_config(config)
+        self._registration_lock = threading.RLock()
+        self._checkpoint_runs: set[str] = set()
+        self._checkpoint_enabled = False
+        self._custom_backend_factory = backend_factory
+        self._backend_factory = create_backend_from_config if backend_factory is None else backend_factory
+        self.backend = self._make_backend(config)
+        # Keep the existing process/run admission owner. Host budgets are explicit
+        # and apply only to Docker resources on this host, not remote sandboxes.
+        self.host_capacity = (
+            HostJudgeCapacity(config.judge_host_capacity)
+            if config.judge_host_capacity is not None else None
+        )
+        if config.judge_host_memory_capacity is not None:
+            memory_bytes = parse_bytes(config.judge_host_memory_capacity)
+            if memory_bytes < 1 or self.host_capacity is None:
+                raise ValueError("Judge host memory requires a positive size and host capacity")
+            self.host_memory_capacity = HostJudgeCapacity(
+                memory_bytes, os.environ.get("SFORGE_JUDGE_HOST_MEMORY_FILE", JUDGE_HOST_MEMORY_FILE)
+            )
+        else:
+            self.host_memory_capacity = None
+        if self.host_capacity is not None and self.backend.backend_name == "docker":
+            for capacity in (self.host_capacity, self.host_memory_capacity):
+                if capacity is not None:
+                    capacity.reconcile_stale_holders(self.backend.reconcile_judge_capacity_holder)
 
         self._reaper_stop = threading.Event()
         self._reaper_thread = threading.Thread(
             target=self._reaper_loop, daemon=True
         )
         self._reaper_thread.start()
+
+    def _make_backend(self, config: SForgeConfig) -> ContainerBackend:
+        backend = self._backend_factory(config)
+        if backend is None:
+            raise TypeError("backend factory must return a backend")
+        return backend
 
     def _reaper_loop(self) -> None:
         while not self._reaper_stop.is_set():
@@ -291,62 +594,120 @@ class JudgeState:
                          e2b_template_map: dict[str, str] | None = None,
                          e2b_template_namespace: str | None = None,
                          e2b_sandbox_ttl: int | None = None) -> str:
+        with self._registration_lock:
+            if run_id in self._checkpoint_runs:
+                raise ValueError("A restored run cannot be cold-registered again")
+            if self._checkpoint_enabled:
+                from sforge.harness.checkpoint import RESTORE_MARKER
+                if (self.config.log_dir / "runs" / run_id / RESTORE_MARKER).exists():
+                    raise ValueError("A restored run cannot be cold-registered again")
+            info, prepared_backend, token = self._prepare_session(task_id, run_id,
+                judge_cpu_limit=judge_cpu_limit,
+                judge_mem_limit=judge_mem_limit,
+                backend=backend,
+                k8s_image_registry=k8s_image_registry,
+                k8s_namespace=k8s_namespace,
+                k8s_node_selector=k8s_node_selector,
+                k8s_kubeconfig=k8s_kubeconfig,
+                max_agent_submissions=max_agent_submissions,
+                submission_cooldown=submission_cooldown,
+                e2b_template_map=e2b_template_map,
+                e2b_template_namespace=e2b_template_namespace,
+                e2b_sandbox_ttl=e2b_sandbox_ttl,
+            )
+            with self._tokens_lock:
+                return self._publish_session(info, prepared_backend, token)
+
+    def _publish_session(self, info: dict, prepared_backend: ContainerBackend | None, token: str) -> str:
+        """Called under the native registration and token locks after preparation."""
+        run_key = self._run_key(info["run_id"], info["task_id"])
+        self.run_resource_limits[run_key] = {
+            "judge_cpu_limit": info["judge_cpu_limit"], "judge_mem_limit": info["judge_mem_limit"],
+        }
+        if prepared_backend is not None:
+            self.run_backends[run_key] = prepared_backend
+        self.tokens[token] = info
+        return token
+
+    def _prepare_session(self, task_id: str, run_id: str,
+                         judge_cpu_limit: int | None = None,
+                         judge_mem_limit: str | None = None,
+                         backend: str | None = None,
+                         k8s_image_registry: str | None = None,
+                         k8s_namespace: str | None = None,
+                         k8s_node_selector: dict[str, str] | None = None,
+                         k8s_kubeconfig: str | None = None,
+                         max_agent_submissions: int | None = None,
+                         submission_cooldown: int | None = None,
+                         e2b_template_map: dict[str, str] | None = None,
+                         e2b_template_namespace: str | None = None,
+                         e2b_sandbox_ttl: int | None = None) -> tuple[dict, ContainerBackend | None, str]:
         if task_id not in self.tasks:
             raise ValueError(f"Unknown task: {task_id}")
-        token = secrets.token_hex(16)
-        with self._tokens_lock:
-            self.tokens[token] = {
-                "task_id": task_id,
-                "run_id": run_id,
-                "next_agent": 1,
-                "next_auto": 1,
-                "judge_cpu_limit": judge_cpu_limit,
-                "judge_mem_limit": judge_mem_limit,
-                "max_agent_submissions": max_agent_submissions,
-                "submission_cooldown": submission_cooldown,
-                "last_agent_submit_at": 0.0,
-            }
-            run_key = self._run_key(run_id, task_id)
-            self.run_resource_limits[run_key] = {
-                "judge_cpu_limit": judge_cpu_limit,
-                "judge_mem_limit": judge_mem_limit,
-            }
-            effective_e2b_template_map = (
-                self.config.e2b_template_map
-                if not e2b_template_map
-                else e2b_template_map
+        backend_override = None
+        info = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "registration_id": uuid.uuid4().hex,
+            "next_agent": 1,
+            "next_auto": 1,
+            "judge_cpu_limit": judge_cpu_limit,
+            "judge_mem_limit": judge_mem_limit,
+            "max_agent_submissions": max_agent_submissions,
+            "submission_cooldown": submission_cooldown,
+            "last_agent_submit_at": 0.0,
+        }
+        effective_e2b_template_map = (
+            self.config.e2b_template_map
+            if not e2b_template_map
+            else e2b_template_map
+        )
+        effective_e2b_template_namespace = (
+            self.config.e2b_template_namespace
+            if not e2b_template_namespace
+            else e2b_template_namespace
+        )
+        effective_e2b_sandbox_ttl = (
+            self.config.e2b_sandbox_ttl
+            if e2b_sandbox_ttl is None
+            else e2b_sandbox_ttl
+        )
+        e2b_config_changed = backend == "e2b" and (
+            effective_e2b_template_map != self.config.e2b_template_map
+            or effective_e2b_template_namespace
+            != self.config.e2b_template_namespace
+            or effective_e2b_sandbox_ttl != self.config.e2b_sandbox_ttl
+        )
+        if self._custom_backend_factory is not None or (backend and (
+            backend != self.backend.backend_name or e2b_config_changed
+        )):
+            effective_config = replace(
+                self.config, backend=backend or self.config.backend,
+                k8s_namespace=k8s_namespace or self.config.k8s_namespace,
+                k8s_node_selector=k8s_node_selector or self.config.k8s_node_selector,
+                k8s_image_registry=k8s_image_registry or self.config.k8s_image_registry,
+                k8s_kubeconfig=k8s_kubeconfig or self.config.k8s_kubeconfig,
+                e2b_template_map=effective_e2b_template_map,
+                e2b_template_namespace=effective_e2b_template_namespace,
+                e2b_sandbox_ttl=effective_e2b_sandbox_ttl,
+                judge_cpu_limit=self.config.judge_cpu_limit if judge_cpu_limit is None else judge_cpu_limit,
+                judge_mem_limit=self.config.judge_mem_limit if judge_mem_limit is None else judge_mem_limit,
             )
-            effective_e2b_template_namespace = (
-                self.config.e2b_template_namespace
-                if not e2b_template_namespace
-                else e2b_template_namespace
-            )
-            effective_e2b_sandbox_ttl = (
-                self.config.e2b_sandbox_ttl
-                if e2b_sandbox_ttl is None
-                else e2b_sandbox_ttl
-            )
-            e2b_config_changed = backend == "e2b" and (
-                effective_e2b_template_map != self.config.e2b_template_map
-                or effective_e2b_template_namespace
-                != self.config.e2b_template_namespace
-                or effective_e2b_sandbox_ttl != self.config.e2b_sandbox_ttl
-            )
-            if backend and (
-                backend != self.backend.backend_name or e2b_config_changed
-            ):
+            if self._custom_backend_factory is not None:
+                backend_override = self._make_backend(effective_config)
+            else:
                 from sforge.harness.backend.factory import create_backend
-                self.run_backends[run_key] = create_backend(
-                    backend,
-                    k8s_namespace=k8s_namespace or self.config.k8s_namespace,
-                    k8s_node_selector=k8s_node_selector or self.config.k8s_node_selector,
-                    k8s_image_registry=k8s_image_registry or self.config.k8s_image_registry,
-                    k8s_kubeconfig=k8s_kubeconfig or self.config.k8s_kubeconfig,
-                    e2b_template_map=effective_e2b_template_map,
-                    e2b_template_namespace=effective_e2b_template_namespace,
-                    e2b_sandbox_ttl=effective_e2b_sandbox_ttl,
+                backend_override = create_backend(
+                    effective_config.backend,
+                    k8s_namespace=effective_config.k8s_namespace,
+                    k8s_node_selector=effective_config.k8s_node_selector,
+                    k8s_image_registry=effective_config.k8s_image_registry,
+                    k8s_kubeconfig=effective_config.k8s_kubeconfig,
+                    e2b_template_map=effective_config.e2b_template_map,
+                    e2b_template_namespace=effective_config.e2b_template_namespace,
+                    e2b_sandbox_ttl=effective_config.e2b_sandbox_ttl,
                 )
-        return token
+        return info, backend_override, secrets.token_hex(16)
 
     @staticmethod
     def _run_key(run_id: str, task_id: str) -> str:
@@ -375,7 +736,7 @@ class JudgeState:
         Raises SubmissionBudgetExceeded or SubmissionCooldownActive on violation.
         Auto submissions are never limited.
         """
-        with self._tokens_lock:
+        with self._registration_lock, self._tokens_lock:
             info = self.tokens.get(token)
             if info is None:
                 raise KeyError("Invalid token")
@@ -414,23 +775,7 @@ class JudgeState:
         return info["task_id"], info["run_id"], round_id, info.get("judge_cpu_limit"), info.get("judge_mem_limit"), remaining
 
     def _record_submission(self, run_id: str, submission_id: str, task_id: str, round_id: str | None, report_dict: dict | None, error: str | None, status: str = "completed") -> None:
-        entry: dict[str, Any] = {
-            "type": "submission",
-            "status": status,
-            "submission_id": submission_id,
-            "task_id": task_id,
-            "round": round_id,
-        }
-        if report_dict:
-            entry["pass_rate"] = report_dict.get("pass_rate", 0.0)
-            entry["score"] = report_dict.get("score")
-            entry["passed"] = report_dict.get("passed", 0)
-            entry["failed"] = report_dict.get("failed", 0)
-            entry["total_tests"] = report_dict.get("total_tests", 0)
-            entry["valid"] = report_dict.get("valid", True)
-            entry["summary"] = report_dict.get("summary")
-        if error:
-            entry["error"] = error
+        entry = submission_history_entry(submission_id, task_id, round_id, report_dict, error, status)
         history_key = f"{run_id}/{task_id}"
         with self._history_lock:
             entries = self.run_history.setdefault(history_key, [])
@@ -474,37 +819,180 @@ class JudgeState:
         task_list = load_all_tasks(self.config.tasks_dir, benchmark)
         self.tasks = {t.task_id: t for t in task_list}
 
+    def close(self) -> None:
+        """Drain accepted evaluations on graceful shutdown; stop new admission."""
+        with self._admission_lock:
+            self._closed = True
+        self._reaper_stop.set()
+        self._executor.shutdown(wait=True)
+        self._reaper_thread.join()
+
+    def _reserve(self, run_id: str | None, task_id: str) -> None:
+        limit = self.config.judge_max_outstanding_per_run
+        key = (run_id, task_id) if run_id is not None and limit is not None else None
+        if key is not None and self._outstanding_by_run.get(key, 0) >= limit:
+            raise JudgeCapacityExceeded("Run/task evaluation capacity full; retry this snapshot later")
+        if self._closed or not self._capacity.acquire(blocking=False):
+            raise JudgeCapacityExceeded("Judge capacity full; retry this snapshot later")
+        if key is not None:
+            self._outstanding_by_run[key] = self._outstanding_by_run.get(key, 0) + 1
+
+    def _release(self, run_id: str | None, task_id: str) -> None:
+        with self._admission_lock:
+            if run_id is not None and self.config.judge_max_outstanding_per_run is not None:
+                key = (run_id, task_id)
+                remaining = self._outstanding_by_run[key] - 1
+                if remaining:
+                    self._outstanding_by_run[key] = remaining
+                else:
+                    del self._outstanding_by_run[key]
+            self._capacity.release()
+
+    def submit_for_token(self, token: str, archive: bytes, kind: str) -> tuple[str, str, int | None]:
+        """Reserve capacity before spending a round or starting its cooldown."""
+        with self._admission_lock:
+            session = self.resolve_token(token)
+            run_id, task_id = session["run_id"], session["task_id"]
+            self._reserve(run_id, task_id)
+            try:
+                # Spool before consuming budget: disk failure must not spend a round.
+                spool = self._spool(archive)
+            except BaseException:
+                self._release(run_id, task_id)
+                raise
+            try:
+                task_id, run_id, round_id, cpu, mem, remaining = self.consume_round(token, kind)
+            except BaseException:
+                try:
+                    spool.unlink(missing_ok=True)
+                finally:
+                    self._release(run_id, task_id)
+                raise
+            submission_id = self._enqueue(task_id, spool, run_id, round_id, cpu, mem)
+            return submission_id, round_id, remaining
+
     def submit(self, task_id: str, archive: bytes, run_id: str | None = None, round: str | None = None,
                judge_cpu_limit: int | None = None, judge_mem_limit: str | None = None) -> str:
-        """Submit and grade asynchronously. Returns submission_id for polling."""
-        if task_id not in self.tasks:
-            raise ValueError(f"Unknown task: {task_id}")
+        """Submit within the same aggregate and optional run/task limits as HTTP."""
+        with self._admission_lock:
+            if task_id not in self.tasks:
+                raise ValueError(f"Unknown task: {task_id}")
+            self._reserve(run_id, task_id)
+            try:
+                spool = self._spool(archive)
+            except BaseException:
+                self._release(run_id, task_id)
+                raise
+            return self._enqueue(task_id, spool, run_id, round, judge_cpu_limit, judge_mem_limit)
 
+    def _spool(self, archive: bytes) -> Path:
+        # Queued snapshots must not accumulate in RAM. Retain the spool after a
+        # process crash for operator recovery, but do not claim automatic replay.
+        directory = self.config.log_dir / "judge-pending"
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=directory, suffix=".tar.gz", delete=False) as f:
+            path = Path(f.name)
+            try:
+                f.write(archive)
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+        return path
+
+    def _enqueue(self, task_id: str, spool: Path, run_id: str | None,
+                 round_id: str | None, cpu: int | None, mem: str | None) -> str:
         submission_id = uuid.uuid4().hex[:12]
-        log_run_id = run_id or submission_id
         self.submissions[submission_id] = {
-            "status": SubmissionStatus.QUEUED,
-            "task_id": task_id,
-            "run_id": run_id,
-            "round": round,
-            "report": None,
-            "error": None,
+            "status": SubmissionStatus.QUEUED, "task_id": task_id,
+            "run_id": run_id, "round": round_id, "report": None, "error": None,
+            "submitted_at": time.time(),
         }
-        self._record_submission(log_run_id, submission_id, task_id, round, None, None, status="running")
-
-        thread = threading.Thread(
-            target=self._grade_worker,
-            args=(submission_id, task_id, archive, run_id, round,
-                  judge_cpu_limit, judge_mem_limit),
-            daemon=True,
-        )
-        thread.start()
+        try:
+            self._record_submission(run_id or submission_id, submission_id, task_id,
+                                    round_id, None, None, status="queued")
+            self._executor.submit(self._grade_spooled, submission_id, task_id,
+                                  spool, run_id, round_id, cpu, mem)
+        except BaseException as e:
+            self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
+            try:
+                self._record_submission(run_id or submission_id, submission_id, task_id,
+                                        round_id, None, str(e), status="error")
+            finally:
+                try:
+                    spool.unlink(missing_ok=True)
+                finally:
+                    self._release(run_id, task_id)
+            raise
         return submission_id
 
+    def _grade_spooled(self, submission_id: str, task_id: str, spool: Path,
+                       run_id: str | None, round_id: str | None,
+                       cpu: int | None, mem: str | None) -> None:
+        backend = self._get_backend(run_id, task_id)
+        token = f"{os.getpid()}:{submission_id}"
+        slot_acquired = memory_acquired = False
+        owner_id = None
+        try:
+            if self.host_capacity is not None and backend.backend_name == "docker":
+                owner_id = backend.judge_capacity_owner_id()
+                if owner_id is None:
+                    raise RuntimeError("Docker engine identity is required for host judge capacity")
+                memory_units = None
+                if self.host_memory_capacity is not None:
+                    memory_limit = (mem if mem is not None else self.config.judge_mem_limit)
+                    if memory_limit is None:
+                        memory_limit = self.tasks[task_id].judge.mem_limit
+                    memory_units = (parse_bytes(memory_limit) if memory_limit is not None
+                                    else self.host_memory_capacity.capacity)
+                    if memory_units < 1 or memory_units > self.host_memory_capacity.capacity:
+                        raise ValueError("Judge memory requirement exceeds host memory capacity")
+                while True:
+                    slot_acquired = self.host_capacity.try_acquire(token, owner_id)
+                    if not slot_acquired:
+                        time.sleep(0.2)
+                        continue
+                    if self.host_memory_capacity is None:
+                        break
+                    memory_acquired = self.host_memory_capacity.try_acquire(token, owner_id, units=memory_units)
+                    if memory_acquired:
+                        break
+                    self.host_capacity.release(token)
+                    slot_acquired = False
+                    time.sleep(0.2)
+            self._grade_worker(submission_id, task_id, spool.read_bytes(), run_id, round_id, cpu, mem)
+        except Exception as e:
+            self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
+            self._record_submission(run_id or submission_id, submission_id, task_id,
+                                    round_id, None, str(e), status="error")
+        finally:
+            # A terminal report or cleanup exception does not establish that the
+            # owned container disappeared. Retain both ledgers if Docker cannot
+            # confirm absence; a later dead-owner reconciliation can recover them.
+            cleaned = not slot_acquired
+            if slot_acquired:
+                try:
+                    cleaned = backend.reconcile_judge_capacity_holder(token, owner_id)
+                except Exception:
+                    logger.exception("Judge cleanup unconfirmed; retaining host capacity")
+            if cleaned:
+                for acquired, capacity in ((memory_acquired, self.host_memory_capacity),
+                                           (slot_acquired, self.host_capacity)):
+                    if acquired:
+                        try:
+                            capacity.release(token)
+                        except Exception:
+                            logger.exception("Could not release confirmed judge host capacity")
+            try:
+                spool.unlink(missing_ok=True)
+            finally:
+                self._release(run_id, task_id)
+
     def _grade_worker(self, submission_id: str, task_id: str, archive: bytes,
-                      run_id: str | None = None, round: int | None = None,
+                      run_id: str | None = None, round: str | None = None,
                       judge_cpu_limit: int | None = None, judge_mem_limit: str | None = None) -> None:
         self.submissions[submission_id]["status"] = SubmissionStatus.RUNNING
+        self._record_submission(run_id or submission_id, submission_id, task_id,
+                                round, None, None, status="running")
         try:
             task_spec = self.tasks[task_id]
             log_run_id = run_id or submission_id
@@ -525,17 +1013,20 @@ class JudgeState:
                 config=config,
                 backend=self._get_backend(run_id, task_id),
                 submission_id=submission_id,
+                submitted_at=self.submissions[submission_id]["submitted_at"],
                 log_dir=sub_log_dir,
             )
             report_dict = report.to_dict()
             report_dict.pop("score_0_100", None)
-            self.submissions[submission_id]["status"] = SubmissionStatus.COMPLETED
-            self.submissions[submission_id]["report"] = report_dict
-            self._record_submission(log_run_id, submission_id, task_id, round, report_dict, None)
+            with self._registration_lock:
+                self.submissions[submission_id]["status"] = SubmissionStatus.COMPLETED
+                self.submissions[submission_id]["report"] = report_dict
+                self._record_submission(log_run_id, submission_id, task_id, round, report_dict, None)
         except Exception as e:
-            self.submissions[submission_id]["status"] = SubmissionStatus.ERROR
-            self.submissions[submission_id]["error"] = str(e)
-            self._record_submission(log_run_id, submission_id, task_id, round, None, str(e))
+            with self._registration_lock:
+                self.submissions[submission_id]["status"] = SubmissionStatus.ERROR
+                self.submissions[submission_id]["error"] = str(e)
+                self._record_submission(log_run_id, submission_id, task_id, round, None, str(e), status=SubmissionStatus.ERROR)
 
     def get_result(self, submission_id: str) -> dict | None:
         return self.submissions.get(submission_id)
@@ -876,13 +1367,31 @@ class JudgeState:
 # --- FastAPI app factory ---
 
 
-def create_app(config: SForgeConfig | None = None) -> FastAPI:
+def create_app(
+    config: SForgeConfig | None = None, *, checkpoints: bool = False,
+    backend_factory: Callable[[SForgeConfig], ContainerBackend] | None = None,
+) -> FastAPI:
     if config is None:
         config = load_config()
 
-    app = FastAPI(title="SForge Judge", version=__version__)
-    state = JudgeState(config)
+    if type(checkpoints) is not bool:
+        raise ValueError("checkpoints must be an explicit boolean")
+    state = JudgeState(config, backend_factory=backend_factory)
     state.load_tasks()
+    state._checkpoint_enabled = checkpoints
+
+    @asynccontextmanager
+    async def lifespan(app):
+        try:
+            yield
+        finally:
+            state.close()
+
+    app = FastAPI(title="SForge Judge", version=__version__, lifespan=lifespan)
+    app.state.judge = state
+    if checkpoints:
+        from sforge.harness.checkpoint import install_routes
+        install_routes(app, state)
 
     @app.get("/api/v1/result/{submission_id}")
     def get_result(submission_id: str) -> ResultResponse:
@@ -939,24 +1448,19 @@ def create_app(config: SForgeConfig | None = None) -> FastAPI:
         if kind == "auto" and admin_secret != state.admin_secret:
             raise HTTPException(status_code=403, detail="admin_secret required for auto submissions")
         try:
-            task_id, run_id, round_id, judge_cpu_limit, judge_mem_limit, remaining = state.consume_round(token, kind)
+            submission_id, round_id, remaining = state.submit_for_token(
+                token, archive.file.read(), kind,
+            )
+            return SubmitResponse(
+                submission_id=submission_id, round_id=round_id,
+                status=SubmissionStatus.QUEUED, remaining_submissions=remaining,
+            )
         except KeyError:
             raise HTTPException(status_code=401, detail="Invalid token")
-        except SubmissionBudgetExceeded as e:
+        except (SubmissionBudgetExceeded, SubmissionCooldownActive) as e:
             raise HTTPException(status_code=429, detail=str(e))
-        except SubmissionCooldownActive as e:
-            raise HTTPException(status_code=429, detail=str(e))
-        archive_data = archive.file.read()
-        try:
-            submission_id = state.submit(task_id, archive_data, run_id, round_id,
-                                         judge_cpu_limit=judge_cpu_limit,
-                                         judge_mem_limit=judge_mem_limit)
-            return SubmitResponse(
-                submission_id=submission_id,
-                round_id=round_id,
-                status=SubmissionStatus.QUEUED,
-                remaining_submissions=remaining,
-            )
+        except JudgeCapacityExceeded as e:
+            raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "5"})
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 

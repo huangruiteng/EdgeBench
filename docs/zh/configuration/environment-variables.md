@@ -79,8 +79,16 @@ E2B 原生域名白名单直接放行。
 |------|------|
 | `SFORGE_WORK_CPU_LIMIT` | Work 容器的 CPU 核数（例如 `4`） |
 | `SFORGE_WORK_MEM_LIMIT` | Work 容器的内存限制（例如 `8g`） |
+| `SFORGE_JUDGE_HOST_CAPACITY` | 同一主机上所有 SForge Server 进程共享的 Docker Judge 槽位数（默认不启用；设为正整数开启） |
+| `SFORGE_JUDGE_HOST_MEMORY_CAPACITY` | 可选的主机级 Judge 内存预算（例如 `24g`）。已声明的 Judge 内存限制按实际字节计费；未声明限制的 Judge 占用整份预算，因此单独运行。 |
+| `SFORGE_JUDGE_HOST_SLOT_FILE` | 覆盖主机级槽位账本路径（默认 `/tmp/sforge-judge-host-slots.json`） |
+| `SFORGE_JUDGE_HOST_OWNER_FILE` | 覆盖崩溃恢复使用的 backend owner sidecar 路径（默认 `/tmp/sforge-judge-host-owners.json`） |
+| `SFORGE_JUDGE_HOST_MEMORY_FILE` | 覆盖主机级内存账本路径（默认 `/tmp/sforge-judge-host-memory.json`） |
 
 Judge CPU/内存限制目前通过 CLI 参数（`--judge-cpu-limit`、`--judge-mem-limit`）或实验 YAML（`judge_cpu_limit`、`judge_mem_limit`）设置，不通过环境变量读取。
+内存预算只控制准入，不替代容器内存限制；需要多个 Judge 共享预算时，应同时设置实际的 Judge 内存限制。Docker owner 异常退出后，只有同一 Docker Engine 确认孤儿 Judge 容器已清理，SForge 才会回收对应容量。
+
+主机预算仅针对 Docker Judge，并复用既有进程/运行准入队列。各 launcher 应一致设置，例如 `SFORGE_JUDGE_HOST_CAPACITY=8 SFORGE_JUDGE_HOST_MEMORY_CAPACITY=24g`；不设这两个变量则保留原进程级准入。清理失败时保留名额和内存预算，直到确认所拥有容器已移除；仅重启 launcher 不会释放预算。
 
 ## 容器后端变量
 
@@ -155,3 +163,40 @@ export SFORGE_BACKEND="k8s"
 export SFORGE_K8S_NAMESPACE="sforge-runs"
 export SFORGE_K8S_IMAGE_REGISTRY="registry.example.com/sforge"
 ```
+
+## 评测服务容量
+
+`serve` 默认改为每个服务进程最多同时运行 2 个评测，额外排队 32 个快照，
+不再为每次提交无界创建评测线程。例如：
+
+```bash
+sforge serve --judge-max-concurrent 1 --judge-max-pending 32
+```
+
+对应环境变量为 `SFORGE_JUDGE_MAX_CONCURRENT`（至少 1）和
+`SFORGE_JUDGE_MAX_PENDING`（至少 0）。限制由服务持有，覆盖所有任务、run
+和 agent/auto 提交；多个进程各自计数。交互游戏和直接 `sforge eval` 不走此队列。
+
+可选设置 `--judge-max-outstanding-per-run 1` 或
+`SFORGE_JUDGE_MAX_OUTSTANDING_PER_RUN=1`（整数，至少 1），限制每个
+`(run_id, task_id)` **排队加运行中**的评测总数。同一 run/task 的所有会话 token、
+agent/auto 和直接 `JudgeState.submit` 提交共用计数；同一 run 的不同任务独立计数。
+未提供 run ID 的直接提交仅受服务总容量限制。默认不设置，保持原有总容量准入行为。
+结果及历史查询不占用容量；完成、失败或优雅排空都会释放预留。
+
+单 run/task 容量满时，在落盘和消耗轮次之前返回相同的 503/Retry-After。
+提交冷却不能代替此限制：前一次评测尚未完成，冷却可能已经到期。
+总容量至少等于活跃 run/task 对数、单对上限为 1 时，可以避免某对的重叠提交
+挤占另一对的首次提交机会；这不保证完成延迟相同，也不能证明硬件吞吐足够。
+配置在服务进程生命周期内固定。禁用时先排空并停止服务，移除该参数及环境变量后重启。
+
+快照按受理顺序落盘排队，多 worker 的完成顺序可以不同；报告保留受理时间，
+执行耗时不含排队。不会合并快照或缓存分数。
+容量满返回带 Retry-After 的 503，不消耗提交次数、不分配轮次、不触发冷却。
+要无损采样，客户端必须保留原快照重试；当前周期自动评测器只记录失败 tick，不自动重试。
+队列限制资源而非延迟，输入持续超过吞吐时需降低采样频率或增加合格资源。
+
+优雅关闭会等待已受理任务完成。会话、计数和队列元数据仍在内存中，
+不是崩溃恢复机制，孤立 spool 文件不足以重建运行；重启前必须排空。
+本修改不改变题目、评分规则、单次容器限制或反馈权限。回滚需排空后停止服务，
+再部署旧版；不提供无界并发开关。

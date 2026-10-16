@@ -80,8 +80,72 @@ host allowlist directly.
 |----------|---------|
 | `SFORGE_WORK_CPU_LIMIT` | Number of CPUs for work containers (e.g., `4`) |
 | `SFORGE_WORK_MEM_LIMIT` | Memory limit for work containers (e.g., `8g`) |
+| `SFORGE_JUDGE_HOST_CAPACITY` | Host-wide judge slot count shared across SForge server processes (unset by default; set a positive integer to enable) |
+| `SFORGE_JUDGE_HOST_MEMORY_CAPACITY` | Optional host-wide judge memory budget (for example, `24g`). Declared judge memory limits are charged against this budget; a judge without a limit is charged the full budget and therefore runs alone. |
+| `SFORGE_JUDGE_HOST_SLOT_FILE` | Override the host-wide slot ledger path (default: `/tmp/sforge-judge-host-slots.json`) |
+| `SFORGE_JUDGE_HOST_OWNER_FILE` | Override the backend-owner sidecar path used for crash recovery (default: `/tmp/sforge-judge-host-owners.json`) |
+| `SFORGE_JUDGE_HOST_MEMORY_FILE` | Override the host-wide memory ledger path (default: `/tmp/sforge-judge-host-memory.json`) |
 
 Judge CPU/memory limits are currently set through CLI flags (`--judge-cpu-limit`, `--judge-mem-limit`) or experiment YAML (`judge_cpu_limit`, `judge_mem_limit`), not environment variables.
+The memory budget is admission control rather than a container limit. Set an actual judge memory limit when concurrent judges should share the budget. SForge recovers dead Docker owners only after the same Docker engine confirms that the orphan judge container has been removed.
+
+Host budgets apply only to Docker judges. Keep the existing process/run admission settings; these budgets do not add a second submission queue. Enable them consistently across launchers, for example `SFORGE_JUDGE_HOST_CAPACITY=8 SFORGE_JUDGE_HOST_MEMORY_CAPACITY=24g`. Omit both variables to retain aggregate-only admission. Cleanup failure retains reservations until owned-container absence is confirmed; restarting a launcher alone does not free them.
+
+## Judge admission and resource limits
+
+`serve` now defaults to **2 active evaluations and 32 additional pending snapshots**
+per server process, instead of creating an evaluation thread for every submission.
+Set the capacity according to available memory and the per-container limits:
+
+```bash
+sforge serve --judge-max-concurrent 1 --judge-max-pending 32
+```
+
+The equivalent environment variables are `SFORGE_JUDGE_MAX_CONCURRENT` (>= 1)
+and `SFORGE_JUDGE_MAX_PENDING` (>= 0). These are server settings; registration
+cannot raise them. Multiple server processes have independent limits. They apply
+across tasks, runs and both agent/auto submissions; interactive game sessions
+and direct synchronous `sforge eval` are separate paths.
+
+To prevent a slow run from occupying several unfinished slots, optionally set
+`--judge-max-outstanding-per-run 1` or `SFORGE_JUDGE_MAX_OUTSTANDING_PER_RUN=1`
+(integer >= 1). This counts **queued plus running** evaluations per
+`(run_id, task_id)`, shared across all session tokens, agent/auto submissions and
+direct `JudgeState.submit` calls. Different tasks in the same run have independent
+counts; direct submissions without a run ID use only the aggregate limit. The
+default is unset, preserving aggregate-only admission. Lookups do not consume
+capacity, and completion, failure or graceful drain releases each reservation.
+
+The per-run limit rejects before spooling or spending a round, using the same
+503/Retry-After contract as aggregate capacity. A submission cooldown does not
+replace this limit: it can expire while an earlier evaluation is still unfinished.
+Setting aggregate capacity to at least the number of distinct active run/task
+pairs, with the per-run limit at one, prevents one pair's overlapping submissions
+from crowding out another pair's first submission. This does not guarantee equal
+completion latency or qualify the hardware's throughput. Settings are fixed for
+the server lifetime. To disable the per-run limit, drain and stop the server,
+remove both the flag and environment variable, then restart.
+
+Accepted snapshots are spooled under the log directory and queued in admission
+order for a fixed worker pool; completion order can differ. Pending snapshots do not retain their archive bytes
+in RAM. Results transition from `queued` to `running` before reaching a terminal
+state. The visualizer excludes missing/invalid reports rather than plotting them as zeros.
+Reports retain the admission timestamp for timelines; runtime still measures
+execution. No snapshots are deduplicated, coalesced, or assigned cached scores.
+
+At capacity, submission returns **503 with Retry-After**, without allocating a
+round, consuming submission budget, or starting a cooldown. Clients must retain
+and retry the same snapshot if they need lossless sampling; the existing periodic
+auto-evaluator logs failed ticks and does not retry them. A queue bounds resource
+use, not scoring latency: if arrivals exceed throughput, reduce sampling or add
+qualified capacity. Larger pending limits also require disk space.
+
+Graceful shutdown drains accepted work. Sessions, queue metadata, and counters
+remain in memory, so this is **not restart recovery**; orphan spool files alone
+are not enough to reconstruct a run. Drain before restarting. This does not change
+task/scoring rules, per-evaluation limits, or feedback visibility. To revert the
+scheduling change, drain, stop, and deploy the previous server revision; there is
+no unlimited-concurrency switch.
 
 ## Container Backend Variables
 

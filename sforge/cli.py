@@ -83,7 +83,8 @@ def _make_config(args) -> SForgeConfig:
     """Build config from CLI args."""
     overrides = {}
     for key in ("log_dir", "tasks_dir", "registry", "backend",
-                 "work_cpu_limit", "work_mem_limit", "judge_cpu_limit", "judge_mem_limit"):
+                 "work_cpu_limit", "work_mem_limit", "judge_cpu_limit", "judge_mem_limit",
+                 "judge_max_concurrent", "judge_max_pending", "judge_max_outstanding_per_run"):
         val = getattr(args, key, None)
         if val is not None:
             overrides[key] = val
@@ -786,7 +787,7 @@ def cmd_serve(args):
 
     from sforge.harness.judge_server import create_app
 
-    app = create_app(config)
+    app = create_app(config, checkpoints=args.checkpoints)
     print(f"Starting SForge judge server on port {args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
 
@@ -1044,6 +1045,12 @@ def main():
     p_serve = subparsers.add_parser("serve", help="Start judge HTTP server")
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=8080)
+    p_serve.add_argument("--judge-max-concurrent", type=int, default=None, help="Maximum active evaluations per server (default: 2)")
+    p_serve.add_argument("--judge-max-pending", type=int, default=None, help="Maximum additional queued snapshots (default: 32)")
+    p_serve.add_argument("--judge-max-outstanding-per-run", type=int, default=None,
+                         help="Maximum queued + running evaluations per run/task (default: unset)")
+    p_serve.add_argument("--checkpoints", action="store_true",
+                         help="Enable admin-only settled Docker registration checkpoints (default off)")
     p_serve.set_defaults(func=cmd_serve)
 
     # proxy
