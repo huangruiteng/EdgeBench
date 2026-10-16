@@ -20,7 +20,7 @@ from sforge.harness.evolve_scripts import generate_submit_script
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
     # No evaluation/container operation is needed for the read-only route.
-    monkeypatch.setattr(judge, "create_backend_from_config", lambda config: None)
+    monkeypatch.setattr(judge, "create_backend_from_config", lambda config: object())
     (tmp_path / "tasks").mkdir()
     (tmp_path / "tasks/BENCHMARK.yaml").write_text("name: availability-test\n")
     state = judge.JudgeState(SForgeConfig(log_dir=tmp_path, tasks_dir=tmp_path / "tasks"))
@@ -36,7 +36,7 @@ def harness(tmp_path, monkeypatch):
         {"type": "submission", "round": "auto-1", "score": 0.9,
          "pass_rate": 1.0, "status": "completed", "timestamp": 2.0},
     ]
-    monkeypatch.setattr(judge, "JudgeState", lambda config: state)
+    monkeypatch.setattr(judge, "JudgeState", lambda config, **kwargs: state)
     app = judge.create_app(state.config)
     yield state, app
     state._reaper_stop.set()
@@ -165,7 +165,7 @@ def test_generated_list_against_http(harness, tmp_path):
         assert exhausted.returncode == 0 and "budget exhausted" in exhausted.stdout
         failed = subprocess.run(["bash", str(script), "--list"], env={**env, "SFORGE_TOKEN": "invalid"},
                                 capture_output=True, text=True, timeout=10)
-        assert failed.returncode != 0 and "Could not read" in failed.stderr
+        assert failed.returncode != 0 and "HTTP 401" in failed.stderr
         assert "Submission History" not in failed.stdout
         legacy = subprocess.run(["bash", str(script), "--list"],
                                 env={**env, "SFORGE_JUDGE_URL": env["SFORGE_JUDGE_URL"] + "/legacy"},

@@ -326,7 +326,12 @@ def test_preserves_old_selected_archive_and_fresh_result_identity(service):
     )
     assert history(client, new_token)["best_round"] == "agent-3"
     assert submit(client, new_token, 20).status_code == 429
-    assert history(client, token) == old
+    # The history is unchanged; availability is a newly sampled server snapshot.
+    current = history(client, token)
+    current_observed = current["agent_submission_availability"].pop("observed_at")
+    previous_observed = old["agent_submission_availability"].pop("observed_at")
+    assert current_observed >= previous_observed
+    assert current == old
 
 
 def test_offline_wait_does_not_refill_cooldown_or_budget(service, monkeypatch):

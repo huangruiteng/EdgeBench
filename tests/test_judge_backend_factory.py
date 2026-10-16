@@ -150,8 +150,14 @@ def test_http_registration_override_uses_app_factory(tmp_path, output, expected)
             if result["status"] in ("completed", "error"):
                 break
             time.sleep(0.01)
-        assert result["status"] == "completed"
-        assert result["report"]["score"] == expected
+        if isinstance(output, Exception):
+            assert result["status"] == "error"
+            assert result["report"] is None
+            assert result["error"]
+            assert "synthetic backend failure" not in result["error"]
+        else:
+            assert result["status"] == "completed"
+            assert result["report"]["score"] == expected
         assert (
             client.get("/api/v1/history", params={"token": token}).json()["best_score"]
             == expected

@@ -272,6 +272,24 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
                     history["best_score"],
                     history["agent_submissions"],
                 ) == ("agent-1", 7, 1)
+                availability = history["agent_submission_availability"]
+                assert availability["remaining_submissions"] == 1
+                assert 3500 <= availability["cooldown_remaining_seconds"] <= 3601
+                assert availability["observed_at"] == admission_now[0]
+                assert (fresh_state.tokens, fresh_state.submissions, fresh_state.run_history) == published
+                import subprocess
+                from sforge.harness.evolve_scripts import generate_submit_script
+                cli = tmp_path / "sforge-submit"
+                cli.write_text(generate_submit_script())
+                listed = subprocess.run(["bash", str(cli), "--list"],
+                    env={**os.environ, "SFORGE_JUDGE_URL": url, "SFORGE_TOKEN": fresh,
+                         "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"},
+                    capture_output=True, text=True, timeout=20)
+                assert listed.returncode == 0, listed.stderr
+                assert "Remaining submissions: 1" in listed.stdout
+                assert "Cooldown: wait" in listed.stdout
+                assert "does not reserve" in listed.stdout
+                assert (fresh_state.tokens, fresh_state.submissions, fresh_state.run_history) == published
                 sid = history["entries"][0]["submission_id"]
                 assert sid != first.json()["submission_id"]
                 assert result(url, sid)["report"] == graded["report"]
@@ -287,6 +305,9 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
                 # Advance only the native admission clock. Evaluation/container
                 # execution retains the real wall clock and real Docker backend.
                 admission_now[0] += 3601
+                ready = requests.get(url + "/api/v1/history", params={"token": fresh}, timeout=10).json()
+                assert ready["agent_submission_availability"]["cooldown_remaining_seconds"] == 0
+                assert ready["agent_submission_availability"]["remaining_submissions"] == 1
                 # The production runner must reuse this registration, install
                 # the retained candidate, execute next work, drain and clean up.
                 # Synthetic agent code performs one real native submission;
