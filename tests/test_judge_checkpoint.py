@@ -356,6 +356,39 @@ def test_offline_wait_does_not_refill_cooldown_or_budget(service, monkeypatch):
     assert submit(client, fresh, 12).status_code == 429
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_restore_preserves_each_archive_receipt_with_new_lookup_ids(service, legacy):
+    import hashlib
+
+    state, client = service
+    token = register(state, client, max_agent_submissions=3)
+    original = [submit(client, token, score).json()["submission_id"] for score in (3, 5)]
+    if legacy:
+        for sid in original:
+            state.submissions[sid].pop("archive_sha256")
+            state.submissions[sid].pop("archive_bytes")
+    point = capture(state, client, token)
+    response = restore(state, client, point)
+    assert response.status_code == 200, response.text
+    fresh = response.json()["token"]
+    entries = client.get("/api/v1/history", params={"token": fresh}).json()["entries"]
+    assert len(entries) == 2
+    for score, entry, old in zip((3, 5), entries, original):
+        assert entry["submission_id"] != old
+        source = client.get("/api/v1/result/" + old,
+            params={"include_receipt": True, "token": token}).json()
+        recovered = client.get("/api/v1/result/" + entry["submission_id"],
+            params={"include_receipt": True, "token": fresh}).json()
+        assert recovered["report"] == source["report"]
+        assert recovered["receipt"] == source["receipt"]
+        receipt = recovered["receipt"]
+        assert receipt["archive_sha256"] == (None if legacy else
+            hashlib.sha256(str(score).encode()).hexdigest())
+        assert receipt["archive_bytes"] == (None if legacy else 1)
+        assert receipt["round_id"] == entry["round"]
+    assert state.resolve_token(fresh)["next_agent"] == 3
+
+
 def test_pending_allocation_and_duplicate_history_rejected(service):
     state, client = service
     token = register(state, client)
