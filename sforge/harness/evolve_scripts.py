@@ -45,6 +45,7 @@ def generate_submit_script() -> str:
       --details, -d    submit and show detailed per-test results
       --list, -l       list all previous submissions (no new submission)
       --result ID     poll a submission from this run's history (no new submission)
+      --no-wait       return after acceptance, or read --result once without polling
     """
     return _generate_submit_script()
 
@@ -55,7 +56,9 @@ def _generate_submit_script() -> str:
 set -e
 
 LIST_MODE=0
+RESULT_MODE=0
 DETAILS_MODE=0
+NO_WAIT=0
 SUBMISSION_ID=""
 while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -63,12 +66,14 @@ while [ "$#" -gt 0 ]; do
     case "$arg" in
         --list|-l) LIST_MODE=1 ;;
         --details|-d) DETAILS_MODE=1 ;;
+        --no-wait) NO_WAIT=1 ;;
         --result)
             if [ "$#" -eq 0 ] || [ -z "$1" ]; then
                 echo "ERROR: --result requires a submission ID" >&2
                 exit 1
             fi
             SUBMISSION_ID="$1"
+            RESULT_MODE=1
             shift
             ;;
         -h|--help)
@@ -82,6 +87,8 @@ while [ "$#" -gt 0 ]; do
             echo "  --details, -d   Submit and show detailed per-test results (triggers a new submission)"
             echo "  --result ID     Read/poll an existing submission from this run without submitting again"
             echo "                  Combine with --details for full test details"
+            echo "  --no-wait       Submit a snapshot and return its ID without waiting for grading"
+            echo "                  With --result ID: query once; return pending or the final feedback"
             echo "  -h, --help      Show this help message"
             exit 0
             ;;
@@ -109,6 +116,10 @@ fi
 
 if [ "$LIST_MODE" -eq 1 ] && [ -n "$SUBMISSION_ID" ]; then
     echo "ERROR: Choose only one of --list or --result" >&2
+    exit 1
+fi
+if [ "$NO_WAIT" -eq 1 ] && { [ "$LIST_MODE" -eq 1 ] || { [ "$DETAILS_MODE" -eq 1 ] && [ "$RESULT_MODE" -eq 0 ]; }; }; then
+    echo "ERROR: --no-wait cannot be combined with --list or with --details without --result ID" >&2
     exit 1
 fi
 
@@ -215,7 +226,7 @@ echo ""
 echo "========================================"
 echo "  Submitting for evaluation"
 echo "  Archive size: $ARCHIVE_SIZE bytes"
-echo "  Waiting for test results..."
+echo "  Uploading snapshot..."
 echo "========================================"
 echo ""
 
@@ -269,6 +280,16 @@ if [ -n "$ROUND_ID" ]; then
 fi
 fi
 
+echo "  Evaluation uses the submitted archive snapshot; later workspace edits do not change it."
+if [ "$NO_WAIT" -eq 1 ] && [ "$RESULT_MODE" -eq 0 ]; then
+    echo "  Accepted for evaluation; no grading result has been read."
+    echo "  Continue independent work, then check feedback once: sforge-submit --result $SUBMISSION_ID --no-wait --details"
+    exit 0
+fi
+
+if [ "$NO_WAIT" -eq 0 ]; then
+    echo "  Waiting for test results..."
+fi
 for _ in $(seq 1 720); do
     RESULT=$(get_json "$JUDGE_URL/api/v1/result/$SUBMISSION_ID")
     STATUS=$(echo "$RESULT" | jq -r '.status // empty')
@@ -278,6 +299,11 @@ for _ in $(seq 1 720); do
     if [ "$STATUS" != "queued" ] && [ "$STATUS" != "running" ]; then
         echo "ERROR: Missing or unknown evaluation status; recover with --result $SUBMISSION_ID" >&2
         exit 1
+    fi
+    if [ "$NO_WAIT" -eq 1 ]; then
+        echo "  Pending: $SUBMISSION_ID ($STATUS); no score available yet."
+        echo "  Continue independent work; check this same ID later with --result $SUBMISSION_ID --no-wait --details."
+        exit 0
     fi
     sleep 10
 done
@@ -443,6 +469,16 @@ def generate_evolve_prompt(
         "It will package the files, send them to the judge server, and return "
         "results showing score, pass rate, and a summary of findings.\n"
         "- Run `sforge-submit --details` to submit and see detailed per-test results.\n"
+        "- Run `sforge-submit --no-wait` to submit a snapshot and return its ID "
+        "as soon as it is accepted. Acceptance is not a grading result. "
+        "The judge evaluates the archived bytes: later workspace edits do not change "
+        "that submission. You can continue independent work while grading runs, then "
+        "check its feedback once with `sforge-submit --result ID --no-wait --details`. "
+        "If still queued or running, it returns pending with no score; continue useful "
+        "independent work before checking the same ID again. Omit `--no-wait` when "
+        "you need to wait for that result. Keep track of "
+        "which candidate each ID represents, and preserve any version you may need "
+        "to restore; result retrieval does not restore source files.\n"
         "- Run `sforge-submit --list` to view all previous submissions and "
         "their scores and submission IDs for this run.\n"
         "- If submission or polling is interrupted, run `sforge-submit --result ID --details` "
