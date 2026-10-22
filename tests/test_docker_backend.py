@@ -23,7 +23,10 @@ import os
 import threading
 import time
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, ANY
+from types import SimpleNamespace
+
+import docker
 
 import pytest
 
@@ -36,7 +39,7 @@ def test_container_init_defaults_on():
     handle = backend.create_container("fixture-image", "fixture-container")
     client.containers.create.assert_called_once_with(
         "fixture-image", name="fixture-container", detach=True,
-        command="tail -f /dev/null", environment={}, init=True,
+        command="tail -f /dev/null", environment={}, init=True, labels=ANY,
     )
     assert handle.raw is client.containers.create.return_value
 
@@ -276,5 +279,3 @@ def test_docker_reconciliation_tolerates_concurrent_container_deletion_races():
         "123:concurrent-submission", "docker:synthetic-engine"
     )
     assert containers.responses == []
-
-
