@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -50,6 +51,7 @@ def judge(tmp_path, monkeypatch):
     grade_release = threading.Event()
     grade_release.set()
     graded_answers = []
+    graded_archive_digests = []
 
     class TestState(judge_server.JudgeState):
         def load_tasks(self):
@@ -60,6 +62,7 @@ def judge(tmp_path, monkeypatch):
     def grade(**kwargs):
         grade_started.set()
         assert grade_release.wait(timeout=20)
+        graded_archive_digests.append(hashlib.sha256(kwargs["archive"]).hexdigest())
         with tarfile.open(fileobj=io.BytesIO(kwargs["archive"]), mode="r:gz") as archive:
             assert "./answer.txt" in archive.getnames()
             graded_answers.append(archive.extractfile("./answer.txt").read())
@@ -112,7 +115,8 @@ def judge(tmp_path, monkeypatch):
         yield SimpleNamespace(run=run, state=state, token=token, http=http,
                               url=url, patch=patch, cache=cache,
                               grade_started=grade_started, grade_release=grade_release,
-                              graded_answers=graded_answers)
+                              graded_answers=graded_answers,
+                              graded_archive_digests=graded_archive_digests)
     finally:
         grade_release.set()
         state._reaper_stop.set()
@@ -388,3 +392,156 @@ def test_details_alone_still_submits_and_obeys_existing_cooldown(judge):
     rejected = judge.run("--details")
     assert rejected.returncode != 0 and "cooldown" in rejected.stderr.lower()
     assert judge.state.resolve_token(judge.token) == before
+
+
+def test_json_receipt_survives_pending_reads_and_workspace_deletion(judge):
+    judge.grade_release.clear()
+    try:
+        submitted = judge.run("--json", "--no-wait")
+        assert submitted.returncode == 0, submitted.stderr
+        accepted = json.loads(submitted.stdout)
+        sid = accepted_id(judge)
+        assert accepted["submission_id"] == sid and accepted["status"] == "queued"
+        receipt = accepted["receipt"]
+        assert receipt["schema_version"] == "sforge_submission_receipt_v1"
+        assert receipt["task_id"] == "example" and receipt["round_id"] == "agent-1"
+        assert receipt["archive_bytes"] > 0 and len(receipt["archive_sha256"]) == 64
+        before = judge.state.resolve_token(judge.token)
+        shutil.rmtree(judge.patch)
+        pending = judge.run("--json", "--result", sid, "--no-wait")
+        assert pending.returncode == 0, pending.stderr
+        result = json.loads(pending.stdout)
+        assert result["status"] in ("queued", "running")
+        assert result["receipt"] == receipt
+        assert result["report"] is None and not judge.cache.exists()
+    finally:
+        judge.grade_release.set()
+    recovered = judge.run("--json", "--result", sid, "--details")
+    assert recovered.returncode == 0, recovered.stderr
+    result = json.loads(recovered.stdout)
+    assert result["receipt"] == receipt and result["status"] == "completed"
+    assert result["report"]["score"] == 7
+    assert result["report"]["details"][0]["message"] == "public diagnostic"
+    assert judge.graded_answers == [b"synthetic answer"]
+    assert judge.graded_archive_digests == [receipt["archive_sha256"]]
+    assert judge.state.resolve_token(judge.token) == before
+    assert accepted_id(judge) == sid and not judge.cache.exists()
+    history = judge.run("--json", "--list")
+    assert history.returncode == 0
+    assert json.loads(history.stdout)["entries"][0]["submission_id"] == sid
+
+
+@pytest.mark.parametrize("score,valid", [(0, True), (-3.5, True), (None, True), (7, False)])
+def test_json_preserves_native_feedback_without_using_display_cache(judge, score, valid):
+    submitted = judge.run("--json")
+    assert submitted.returncode == 0, submitted.stderr
+    initial = json.loads(submitted.stdout)
+    sid = accepted_id(judge)
+    judge.state.submissions[sid]["report"].update(score=score, valid=valid)
+    judge.cache.write_text('{"best_score": 999, "submissions": []}\n')
+    cached = judge.cache.read_bytes()
+    read = judge.run("--json", "--result", sid, "--no-wait")
+    assert read.returncode == 0, read.stderr
+    result = json.loads(read.stdout)
+    assert result["receipt"] == initial["receipt"]
+    assert result["report"]["score"] == score and result["report"]["valid"] == valid
+    assert judge.cache.read_bytes() == cached
+
+
+@pytest.mark.parametrize("failure", ["error", "missing_report"])
+def test_json_emits_failed_native_result_without_fabricating_a_score(judge, failure):
+    assert judge.run("--json").returncode == 0
+    sid = accepted_id(judge)
+    if failure == "error":
+        judge.state.submissions[sid].update(status="error", report=None,
+                                            error="synthetic grading failure")
+    else:
+        judge.state.submissions[sid]["report"] = None
+    read = judge.run("--json", "--result", sid, "--no-wait")
+    assert read.returncode != 0 and "ERROR:" in read.stderr
+    result = json.loads(read.stdout)
+    assert result["report"] is None
+    assert result["error"] == ("synthetic grading failure" if failure == "error" else None)
+    assert not judge.cache.exists()
+
+
+def test_optional_http_receipt_keeps_default_shapes_and_visibility(judge):
+    submitted = judge.run()
+    assert submitted.returncode == 0
+    sid = accepted_id(judge)
+    url = judge.url + "/api/v1/result/" + sid
+    plain = judge.http.get(url, timeout=5).json()
+    assert set(plain) == {"submission_id", "status", "report", "error"}
+    with_receipt = judge.http.get(url, params={"include_receipt": True,
+        "token": judge.token}, timeout=5).json()
+    assert {k: v for k, v in with_receipt.items() if k != "receipt"} == plain
+    other = judge.state.register_session("example", "other")
+    for token, expected in ((other, 404), ("invalid", 401), (None, 401)):
+        denied = judge.http.get(url, params={"include_receipt": True,
+            **({"token": token} if token else {})}, timeout=5)
+        assert denied.status_code == expected
+        assert "archive_sha256" not in denied.text
+    # Original submissions that predate receipt support remain explicitly unknown.
+    judge.state.submissions[sid].pop("archive_sha256")
+    judge.state.submissions[sid].pop("archive_bytes")
+    unknown = judge.run("--json", "--result", sid, "--no-wait")
+    assert unknown.returncode == 0, unknown.stderr
+    receipt = json.loads(unknown.stdout)["receipt"]
+    assert receipt["archive_sha256"] is None and receipt["archive_bytes"] is None
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+        info = tarfile.TarInfo("./answer.txt")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    reply = judge.http.post(judge.url + "/api/v1/submit", data={"token": other},
+        files={"archive": ("candidate.tar.gz", archive.getvalue())}, timeout=5)
+    assert reply.status_code == 200
+    assert set(reply.json()) == {"submission_id", "round_id", "status", "remaining_submissions"}
+
+
+@pytest.mark.parametrize("field,value", [("round", "agent-wrong"), ("archive_sha256", "bad")])
+def test_json_rejects_mismatched_or_malformed_source_receipt(judge, field, value):
+    assert judge.run("--json").returncode == 0
+    sid = accepted_id(judge)
+    judge.state.submissions[sid][field] = value
+    read = judge.run("--json", "--result", sid, "--no-wait")
+    assert read.returncode != 0 and not read.stdout
+    assert "receipt unavailable or mismatched" in read.stderr
+    assert not judge.cache.exists()
+
+
+@pytest.mark.parametrize("path", ["/api/v1/submit", "result"])
+def test_json_lost_reply_reuses_server_receipt_without_resubmitting(judge, path):
+    with drop_one_reply(judge, path) as (url, gateway):
+        lost = judge.run("--json", judge_url=url)
+        assert gateway.dropped and lost.returncode != 0 and not lost.stdout
+        history = judge.run("--json", "--list", judge_url=url)
+        sid = json.loads(history.stdout)["entries"][0]["submission_id"]
+        before = judge.state.resolve_token(judge.token)
+        shutil.rmtree(judge.patch)
+        recovered = judge.run("--json", "--result", sid, judge_url=url)
+        assert recovered.returncode == 0, recovered.stderr
+        result = json.loads(recovered.stdout)
+        assert result["submission_id"] == sid
+        assert result["receipt"]["archive_sha256"] == judge.graded_archive_digests[0]
+        assert judge.state.resolve_token(judge.token) == before
+
+
+@pytest.mark.parametrize("read_flags", [(), ("--no-wait",)])
+def test_json_cannot_read_other_or_hidden_native_ids(judge, read_flags):
+    assert judge.run("--json").returncode == 0
+    sid = accepted_id(judge)
+    other = judge.state.register_session("example", "other")
+    denied = judge.run("--json", "--result", sid, *read_flags, submit_token=other)
+    assert denied.returncode != 0 and not denied.stdout
+    # The HTTP option itself enforces the same restriction, independently of bash.
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as tar:
+        info = tarfile.TarInfo("./answer.txt")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    auto = judge.state.submit("example", archive.getvalue(), "run", "auto-1")
+    denied = judge.http.get(judge.url + "/api/v1/result/" + auto,
+        params={"include_receipt": True, "token": judge.token}, timeout=5)
+    assert denied.status_code == 404
+    assert not judge.run("--json", "--result", auto, *read_flags).stdout
