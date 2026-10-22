@@ -932,6 +932,7 @@ def run_agent(
             endpoints = build_allowed_endpoints(
                 judge_url, effective_api_url, gateway_ip, logger,
                 resolve_hostnames=backend.backend_name != "e2b",
+                host_ip_overrides=container_extra_hosts,
             )
             net_isolation = backend.create_network_isolation(handle, endpoints, logger)
             net_isolation.apply()
