@@ -43,7 +43,7 @@ def generate_submit_script() -> str:
 
     Flags:
       --details, -d    submit and show detailed per-test results
-      --list, -l       list all previous submissions (no new submission)
+      --list, -l       show submission history and current limits (no new submission)
       --result ID     poll a submission from this run's history (no new submission)
       --no-wait       return after acceptance, or read --result once without polling
     """
@@ -83,7 +83,8 @@ while [ "$#" -gt 0 ]; do
             echo "Results include score, pass rate, and a summary of findings."
             echo ""
             echo "Options:"
-            echo "  --list, -l      List all previous submissions and scores for this run"
+            echo "  --list, -l      Show previous scores, remaining submissions and current cooldown"
+            echo "                   Read-only; does not submit or reserve a round"
             echo "  --details, -d   Submit and show detailed per-test results (triggers a new submission)"
             echo "  --result ID     Read/poll an existing submission from this run without submitting again"
             echo "                  Combine with --details for full test details"
@@ -479,8 +480,10 @@ def generate_evolve_prompt(
         "you need to wait for that result. Keep track of "
         "which candidate each ID represents, and preserve any version you may need "
         "to restore; result retrieval does not restore source files.\n"
-        "- Run `sforge-submit --list` to view all previous submissions and "
-        "their scores and submission IDs for this run.\n"
+        "- Run `sforge-submit --list` to view previous submissions and scores, "
+        "remaining submissions, and current cooldown for this run. This read-only "
+        "query does not submit or reserve a round; the server checks limits again "
+        "when you submit. Older servers may report limits unavailable.\n"
         "- If submission or polling is interrupted, run `sforge-submit --result ID --details` "
         "to read the accepted submission's result without submitting again. "
         "If its ID was not received, inspect `--list` first; do not blindly resubmit.\n\n"
