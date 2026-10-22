@@ -280,9 +280,16 @@ def build_allowed_endpoints(
     logger: logging.Logger,
     *,
     resolve_hostnames: bool = True,
+    host_ip_overrides: dict[str, str] | None = None,
 ) -> list[AllowedEndpoint]:
-    """Build the whitelist of TCP endpoints from judge + API URLs."""
+    """Build allowed TCP endpoints, reusing any container hostname pins.
+
+    Local IPv4 rules must use the same address as the container's hosts file:
+    resolving a pinned name again could admit an address the container never
+    uses. Hostname-based remote policies ignore these local overrides.
+    """
     endpoints: list[AllowedEndpoint] = []
+    host_ip_overrides = host_ip_overrides or {}
 
     parsed = urlparse(judge_url)
     judge_host = parsed.hostname or ""
@@ -295,6 +302,11 @@ def build_allowed_endpoints(
         endpoints.append(
             AllowedEndpoint(ip="", port=judge_port, hostname=judge_host)
         )
+    elif judge_host in host_ip_overrides:
+        endpoints.append(AllowedEndpoint(
+            ip=str(ipaddress.IPv4Address(host_ip_overrides[judge_host])),
+            port=judge_port, hostname=judge_host,
+        ))
     else:
         for ip in resolve_hostname(judge_host, logger):
             endpoints.append(AllowedEndpoint(ip=ip, port=judge_port, hostname=judge_host))
@@ -311,6 +323,11 @@ def build_allowed_endpoints(
             endpoints.append(
                 AllowedEndpoint(ip="", port=api_port, hostname=api_host)
             )
+        elif api_host in host_ip_overrides:
+            endpoints.append(AllowedEndpoint(
+                ip=str(ipaddress.IPv4Address(host_ip_overrides[api_host])),
+                port=api_port, hostname=api_host,
+            ))
         else:
             for ip in resolve_hostname(api_host, logger):
                 endpoints.append(
