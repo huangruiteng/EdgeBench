@@ -55,7 +55,7 @@ def test_custom_pid_one_opt_out_preserves_creation_options():
     )
     client.containers.create.assert_called_once_with(
         "fixture-image", name="fixture-container", detach=True,
-        command="custom-init", environment={"EXAMPLE": "value"}, init=False,
+        command="custom-init", environment={"EXAMPLE": "value"}, init=False, labels=ANY,
         extra_hosts={"example": "127.0.0.1"}, cap_drop=["NET_RAW"],
         nano_cpus=2_000_000_000, mem_limit="512m", user="1000",
     )

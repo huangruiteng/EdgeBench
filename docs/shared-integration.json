@@ -1,0 +1,99 @@
+{
+  "schema_version": "edgebench_shared_integration_v1",
+  "canonical_repository": "huangruiteng/EdgeBench",
+  "canonical_branch": "codex/edgebench-integration",
+  "base_repository": "loopx-agent/EdgeBench",
+  "base_revision": "bd5bca6813717af4e660b8977e62285d0c5e4972",
+  "sources": [
+    {
+      "number": 14,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/14",
+      "head_sha": "5db8bc95a970d63353979dd0faa61a31261e7fef",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 15,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/15",
+      "head_sha": "9067bbf8f43db76010b95e00d1dc8311f0ff18e8",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 16,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/16",
+      "head_sha": "92ce177ba98e3eedd6c804cbd743404244eec5ac",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 17,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/17",
+      "head_sha": "b5cad9c8b479ad014b16a1049176e0d6128c005a",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 18,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/18",
+      "head_sha": "9e02fdcdab313c34713c3c61a7fa9bcdfde5a097",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 19,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/19",
+      "head_sha": "f6fa5a122ac367f3ee3c0ce059b5b5118d1f9789",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 20,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/20",
+      "head_sha": "b32264c5bbc2407ec1bc6e92d880e9d68a1ee77d",
+      "owner": "loopx-agent"
+    },
+    {
+      "number": 21,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/21",
+      "head_sha": "335105493fd709be2ae6ba745eb34e9232aeb9a2",
+      "owner": "loopx-agent"
+    },
+    {
+      "number": 22,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/22",
+      "head_sha": "adf3b049eace43666c19aec07d06219102ec52f1",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 23,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/23",
+      "head_sha": "decf67c3937db8ae95bd2e713d4da3d6fa23185c",
+      "owner": "loopx-agent"
+    },
+    {
+      "number": 24,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/24",
+      "head_sha": "63f4b6b04902656274f1f40d7f26699ca987c62a",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 25,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/25",
+      "head_sha": "8302e580754da5ce2fa72782a0cfd816c17077d0",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 26,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/26",
+      "head_sha": "0e179fda4df9e8a4f1ae4dc56ab61497682118df",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 27,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/27",
+      "head_sha": "4c3f0cdb71486fad0721dae83374ed8312f05c69",
+      "owner": "loopx-agent"
+    },
+    {
+      "number": 28,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/28",
+      "head_sha": "c3a8753f52622a13c61416280ea0c19f4d971f52",
+      "owner": "huangruiteng"
+    }
+  ]
+}

@@ -166,9 +166,12 @@ def test_cancelled_native_worker_removes_waiter_and_keeps_pool_usable(
             log_dir=tmp_path,
             judge_host_capacity=1,
             judge_host_memory_capacity="4g",
-            judge_max_concurrency=1,
+            judge_max_concurrent=1,
         ),
-        backend_factory=lambda _: SimpleNamespace(backend_name="synthetic"),
+        backend_factory=lambda _: SimpleNamespace(
+            backend_name="docker", judge_capacity_owner_id=lambda: "docker:synthetic",
+            reconcile_judge_capacity_holder=lambda *_: True,
+        ),
     )
     state.tasks = {"t": SimpleNamespace(judge=SimpleNamespace(mem_limit="1g"))}
     entered = threading.Event()
@@ -192,24 +195,22 @@ def test_cancelled_native_worker_removes_waiter_and_keeps_pool_usable(
         sid = state.submit("t", b"archive", "run", "auto-1")
         wait(lambda: bool(state.host_capacity._read().get("waiters")))
         state._judge_queue_drained.set()
-        wait(lambda: state._judge_queue.unfinished_tasks == 0)
+        wait(lambda: state.get_result(sid)["status"] in ("error", "completed"))
         assert state.get_result(sid)["status"] == "error"
         assert not entered.is_set()
-        assert state.host_capacity._read()["waiters"] == []
+        wait(lambda: state.host_capacity._read()["waiters"] == [])
         assert state.host_memory_capacity._read()["holders"] == {}
         state.host_capacity.release("holder")
         state._judge_queue_drained.clear()
         sid = state.submit("t", b"archive", "run", "auto-2")
-        wait(lambda: state._judge_queue.unfinished_tasks == 0)
+        wait(lambda: state.get_result(sid)["status"] in ("error", "completed"))
         assert entered.is_set()
         assert state.get_result(sid)["status"] == "completed"
         assert state.host_capacity._read()["holders"] == {}
         assert state.host_memory_capacity._read()["holders"] == {}
     finally:
         state._judge_queue_drained.set()
-        state._judge_queue.put(None)
-        for worker in state._judge_workers:
-            worker.join(5)
+        state.close()
         state._reaper_stop.set()
         state._reaper_thread.join(5)
 

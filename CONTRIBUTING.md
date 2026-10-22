@@ -133,3 +133,28 @@ When filing a bug report, please include:
 - Your Python version (`python --version`) and OS.
 - Docker version (`docker --version`).
 - The task ID and agent involved, if applicable.
+
+
+## Shared contributor integration
+
+The shared candidate for contributions from `huangruiteng` and `loopx-agent` is
+[`huangruiteng/EdgeBench:codex/edgebench-integration`](https://github.com/huangruiteng/EdgeBench/tree/codex/edgebench-integration).
+Both accounts should target this branch for composed validation. Upstream PRs
+retain their independent review and merge status.
+
+[The source manifest](docs/shared-integration.json) records every integrated PR
+head. Update the manifest when a source changes, preserve ancestry, resolve
+behavioral conflicts, and validate the resulting tree before advancing this
+branch. Do not maintain separate competing integration branches per contributor.
+
+Experiments must record an immutable integration commit and the effective task,
+scoring, feedback and budget configuration. Optional checkpoint and Portfolio
+scoring features being present in the tree does not mean they are enabled.
+Historical attempts keep their original source and results when the candidate
+advances; regrading or rerunning creates a distinct record.
+
+The initial composition preserves the disk-spooled process/run admission model,
+adds joint FIFO host slot/memory admission and confirmed Docker cleanup, retains
+checkpoint identities and original deadlines, combines submission availability
+with asynchronous result retrieval, and preserves explicit execution budgets.
+Validation: 413 tests passed and four skipped with a cached Docker fixture.
