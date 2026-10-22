@@ -211,3 +211,70 @@ def test_init_forwards_stop_to_custom_command(real_container):
     assert b"stopped" in handle.raw.logs()
     backend.cleanup_container(handle)
     assert not backend.container_exists(handle.name)
+
+
+def test_docker_reconciles_legacy_dead_holder_without_container():
+    class Containers:
+        def __init__(self):
+            self.queries = []
+
+        def list(self, **kwargs):
+            self.queries.append(kwargs)
+            return []
+
+    containers = Containers()
+    client = SimpleNamespace(
+        info=lambda: {"ID": "synthetic-engine"}, containers=containers,
+    )
+    backend = DockerBackend(client)
+
+    assert backend.reconcile_judge_capacity_holder("123:legacy-submission", None)
+    assert containers.queries == [
+        {"all": True, "filters": {"name": "legacy-submission"}},
+        {"all": True, "filters": {"name": "legacy-submission"}},
+    ]
+
+
+def test_docker_reconciliation_tolerates_concurrent_container_deletion_races():
+    class Container:
+        id = "gone"
+        name = "synthetic.judge.synthetic.concurrent-submission"
+
+        def stop(self, **_kwargs):
+            return None
+
+        def remove(self, **_kwargs):
+            response = SimpleNamespace(
+                status_code=409, url="docker://container", reason="Conflict",
+            )
+            raise docker.errors.APIError(
+                "removal in progress", response=response,
+                explanation="removal of container is already in progress",
+            )
+
+    class Containers:
+        def __init__(self):
+            self.responses = [
+                [Container()],
+                docker.errors.NotFound("listed container disappeared before inspect"),
+                [],
+            ]
+
+        def list(self, **_kwargs):
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    containers = Containers()
+    client = SimpleNamespace(
+        info=lambda: {"ID": "synthetic-engine"}, containers=containers,
+    )
+    backend = DockerBackend(client)
+
+    assert backend.reconcile_judge_capacity_holder(
+        "123:concurrent-submission", "docker:synthetic-engine"
+    )
+    assert containers.responses == []
+
+

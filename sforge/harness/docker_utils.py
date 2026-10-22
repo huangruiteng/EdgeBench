@@ -29,8 +29,11 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from docker.errors import NotFound
 from docker.models.containers import Container
 from docker.utils import split_command
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 HEREDOC_DELIMITER = "EOF_SFORGE_1399519320"
 
@@ -114,21 +117,34 @@ def exec_run_with_exit_code(
 # through this invocation's private directory, never through Docker's host PID.
 _EXEC_SHUTDOWN_GRACE = 20
 _EXEC_DRAIN_GRACE = 5
+_EXEC_DAEMON_READ_ATTEMPTS = 3
+_EXEC_DAEMON_RETRY_DELAY = 0.25
 _EXEC_SUPERVISOR = r"""
-control=$1; grace=$2; drain=$3; shift 3
+control=$1; grace=$2; drain=$3; argv_prefix=$4
 [[ -d "$control" && -p "$control/hold" ]] || exit 125
 if [[ -f "$control/stop" ]]; then
     printf "125\n" > "$control/settled"
     exit 125
 fi
+argc_name=${argv_prefix}_COUNT
+[[ -v "$argc_name" ]] || exit 125
+argc=${!argc_name}
+[[ "$argc" =~ ^[0-9]+$ && $argc -gt 0 ]] || exit 125
+solver_argv=()
+for ((i=0; i<argc; i++)); do
+    arg_name=${argv_prefix}_$i
+    [[ -v "$arg_name" ]] || exit 125
+    solver_argv+=("${!arg_name}")
+    unset "$arg_name"
+done
+unset "$argc_name" argv_prefix argc_name argc arg_name i
 stop=0
 trap 'stop=1' TERM INT HUP
 set -m
-/bin/bash -c '
-    control=$1; shift
+(
     trap "" TERM INT HUP
     exec 3<>"$control/hold" || exit 125
-    (trap - TERM INT HUP; exec "$@") 3>&- &
+    (trap - TERM INT HUP; exec "${solver_argv[@]}") 3>&- &
     child=$!
     wait "$child" 2>/dev/null
     code=$?
@@ -140,7 +156,7 @@ set -m
     fi
     # Stay alive as the process-group anchor until the final group kill.
     read -r -u 3
-' sforge-exec-group "$control" "$@" &
+) &
 group=$!
 # Preserve the command stderr, but suppress supervisor job-control notices.
 exec 2>/dev/null
@@ -209,12 +225,24 @@ def _exec_run(
     argv = split_command(cmd) if isinstance(cmd, str) else list(cmd)
     if not argv:
         raise ValueError("Docker exec command must not be empty")
-    control = f"/tmp/sforge-exec-{uuid.uuid4().hex}"
+    # Task/verifier cleanup may legitimately remove all of /tmp and /var/tmp.
+    # Docker's shared-memory mount is writable by non-root exec users and keeps
+    # the small FIFO/receipt files outside those task scratch directories. No
+    # executable is placed here, so a noexec mount is supported. Creation still
+    # fails before dispatch if the control directory cannot be provisioned.
+    control = f"/dev/shm/sforge-exec-{uuid.uuid4().hex}"
+    argv_prefix = f"_SFORGE_EXEC_{uuid.uuid4().hex.upper()}"
+    exec_environment = dict(environment or {})
+    exec_environment[f"{argv_prefix}_COUNT"] = str(len(argv))
+    exec_environment.update(
+        {f"{argv_prefix}_{index}": arg for index, arg in enumerate(argv)}
+    )
     options = {
         k: v
-        for k, v in (("user", user), ("workdir", workdir), ("environment", environment))
+        for k, v in (("user", user), ("workdir", workdir))
         if v
     }
+    options["environment"] = exec_environment
     control_options = {"user": user} if user else {}
 
     def control_command(script):
@@ -248,10 +276,67 @@ def _exec_run(
     def inspect():
         return container.client.api.exec_inspect(exec_id)
 
+    def retry_daemon_read(operation, description):
+        """Retry idempotent Docker reads across transient daemon transport loss.
+
+        Docker SDK reads can each consume the client's full socket timeout
+        (normally 60 seconds).  Count attempts instead of fitting them inside
+        the much shorter in-container shutdown grace: that grace controls the
+        owned process group, while these retries only recover its terminal
+        evidence after the daemon is responsive again.
+        """
+        last_error = None
+        for attempt in range(_EXEC_DAEMON_READ_ATTEMPTS):
+            try:
+                return operation()
+            except (RequestsTimeout, RequestsConnectionError) as exc:
+                last_error = exc
+                if attempt + 1 < _EXEC_DAEMON_READ_ATTEMPTS:
+                    time.sleep(_EXEC_DAEMON_RETRY_DELAY * (attempt + 1))
+        raise RuntimeError(
+            f"Docker daemon remained unavailable while {description}"
+        ) from last_error
+
+    def read_shutdown_receipt():
+        receipt = retry_daemon_read(
+            lambda: control_command('cat -- "$1/settled"'),
+            "reading the exec shutdown receipt",
+        )
+        try:
+            return int(receipt)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Docker exec shutdown receipt is missing or invalid"
+            ) from exc
+
     def wait_stopped():
         limit = time.monotonic() + _EXEC_SHUTDOWN_GRACE + _EXEC_DRAIN_GRACE
         while True:
-            state = inspect()
+            try:
+                state = retry_daemon_read(inspect, "inspecting exec completion")
+            except NotFound as missing:
+                # Docker may garbage-collect old exec metadata before a long
+                # caller performs its final inspect.  The in-container supervisor
+                # publishes ``settled`` only after the owned process group has
+                # drained, so that receipt remains authoritative even when the
+                # daemon no longer remembers the exec object.
+                try:
+                    exit_code = read_shutdown_receipt()
+                except RuntimeError:
+                    if time.monotonic() >= limit:
+                        raise RuntimeError(
+                            "Docker exec metadata disappeared before shutdown "
+                            "could be confirmed"
+                        ) from missing
+                    time.sleep(0.05)
+                    continue
+                if thread is not None:
+                    thread.join(max(0, limit - time.monotonic()))
+                if thread is not None and thread.is_alive():
+                    raise RuntimeError(
+                        "Docker exec stopped but output stream did not drain"
+                    )
+                return {"Running": False, "ExitCode": exit_code}
             if not state["Running"] and state.get("ExitCode") is not None:
                 if thread is not None:
                     thread.join(max(0, limit - time.monotonic()))
@@ -284,7 +369,7 @@ def _exec_run(
                 control,
                 str(_EXEC_SHUTDOWN_GRACE),
                 str(_EXEC_DRAIN_GRACE),
-                *argv,
+                argv_prefix,
             ],
             **options,
         )["Id"]
@@ -343,8 +428,7 @@ def _exec_run(
             raise errors[0]
         state = wait_stopped()
         try:
-            receipt = control_command('cat -- "$1/settled"')
-            if int(receipt) != state["ExitCode"]:
+            if read_shutdown_receipt() != state["ExitCode"]:
                 raise ValueError("exit-code mismatch")
         except Exception as exc:
             raise RuntimeError(

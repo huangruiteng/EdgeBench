@@ -32,6 +32,10 @@ from sforge.harness.config import SForgeConfig
 
 def _launch_judge(image, label, root, ready, orphan):
     client = docker.from_env()
+    os.environ["SFORGE_JUDGE_HOST_SLOT_FILE"] = str(Path(root) / "slots.json")
+    os.environ["SFORGE_JUDGE_HOST_OWNER_FILE"] = str(
+        Path(root) / "slots.json.owners"
+    )
 
     def judge(**kwargs):
         owned = client.containers.run(

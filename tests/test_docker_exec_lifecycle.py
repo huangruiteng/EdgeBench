@@ -19,6 +19,7 @@ import threading
 
 import docker
 import pytest
+import requests
 
 from sforge.harness import docker_utils
 from sforge.harness.backend.docker_backend import DockerBackend, DockerContainerHandle
@@ -124,6 +125,25 @@ def test_cancel_during_create_does_not_dispatch(container, execute, monkeypatch)
     assert container.exec_run(["test", "!", "-e", "/tmp/dispatched"]).exit_code == 0
 
 
+@pytest.mark.parametrize("user", [None, "65534"])
+@pytest.mark.parametrize("timeout_exit", [False, True])
+def test_task_temp_cleanup_preserves_exec_receipts(container, execute, user, timeout_exit):
+    # A normal verifier may clear scratch files before running its test suite.
+    # Use a dedicated network-disabled container; never touch host temp files.
+    script = 'find /tmp /var/tmp -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; '
+    script += (
+        'trap \'printf "STOPPED\\n"; exit 0\' TERM; sleep 60 & wait'
+        if timeout_exit else 'printf "COMPLETED\\n"; exit 19'
+    )
+    output, code, timed_out, _ = execute(
+        ["bash", "-c", script], timeout=1 if timeout_exit else 5, user=user,
+    )
+    assert timed_out is timeout_exit
+    assert code == (-1 if timeout_exit else 19)
+    assert ("STOPPED" if timeout_exit else "COMPLETED") in output
+    assert execute(["printf", "NEXT"], timeout=5, user=user)[:3] == ("NEXT", 0, False)
+
+
 @pytest.mark.parametrize("exit_code", [0, 17])
 def test_normal_exit_preserves_bytes_arguments_and_unrelated_process(
     container, execute, tmp_path, exit_code
@@ -155,7 +175,18 @@ sys.exit(int(sys.argv[2]))
     assert b"hello\xff\xe4\xb8\xad\n" in b"".join(chunks)
     assert result[0] == b"".join(chunks).decode(errors="replace")
     assert log.read_bytes() == b"prior\n" + b"".join(chunks)
-    assert container.client.api.exec_inspect(neighbor)["Running"]
+    probe = container.exec_run(
+        [
+            "python3",
+            "-c",
+            "from pathlib import Path; assert sum(p.read_bytes()==b'sleep\\x0090\\x00' for p in Path('/proc').glob('[0-9]*/cmdline'))==1",
+        ]
+    )
+    assert probe.exit_code == 0, probe.output
+    assert (
+        container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
+        == 1
+    )
 
 
 def test_explicit_cancellation_drains_shutdown(container, execute, tmp_path):
@@ -233,6 +264,28 @@ print('DONE',flush=True)
         ]
     )
     assert probe.exit_code == 0, probe.output
+
+
+def test_command_can_kill_its_matching_process_without_killing_supervisor(
+    container, execute
+):
+    result = execute(
+        [
+            "bash",
+            "-c",
+            (
+                "ps -eo pid=,args= | grep -E '[b]enchmark-worker' | "
+                "awk '{print $1}' | while read -r pid; do kill -9 \"$pid\"; done"
+            ),
+            "benchmark-worker",
+        ],
+        timeout=5,
+    )
+    assert result[1:3] == (137, False)
+
+    follow_up = execute(["printf", "AFTER_SELF_KILL"], timeout=5)
+    assert follow_up[0] == "AFTER_SELF_KILL"
+    assert follow_up[1:3] == (0, False)
 
 
 def test_nonroot_and_string_command(container, execute):
@@ -318,6 +371,76 @@ def test_missing_shutdown_receipt_is_not_success(container, execute, monkeypatch
     assert container.exec_run(["test", "!", "-e", "/tmp/dispatched"]).exit_code == 0
 
 
+@pytest.mark.parametrize("exit_code", [0, 19])
+def test_missing_exec_metadata_recovers_from_settled_receipt(
+    container, execute, monkeypatch, exit_code
+):
+    create = container.client.api.exec_create
+    inspect = container.client.api.exec_inspect
+    main_exec = {}
+
+    def remember_main(*args, **kwargs):
+        result = create(*args, **kwargs)
+        if "sforge-exec-supervisor" in str(args):
+            main_exec["id"] = result["Id"]
+        return result
+
+    def forget_completed_main(exec_id):
+        if exec_id == main_exec.get("id"):
+            raise docker.errors.NotFound("synthetic expired exec metadata")
+        return inspect(exec_id)
+
+    monkeypatch.setattr(container.client.api, "exec_create", remember_main)
+    monkeypatch.setattr(container.client.api, "exec_inspect", forget_completed_main)
+    result = execute(["bash", "-c", f"printf RECOVERED; exit {exit_code}"], timeout=5)
+    assert result[:3] == ("RECOVERED", exit_code, False)
+    assert (
+        container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
+        == 1
+    )
+
+
+@pytest.mark.parametrize("exit_code", [0, 23])
+def test_missing_exec_metadata_retries_transient_receipt_timeout(
+    container, execute, monkeypatch, exit_code
+):
+    create = container.client.api.exec_create
+    inspect = container.client.api.exec_inspect
+    control = container.exec_run
+    main_exec = {}
+    receipt_reads = 0
+
+    def remember_main(*args, **kwargs):
+        result = create(*args, **kwargs)
+        if "sforge-exec-supervisor" in str(args):
+            main_exec["id"] = result["Id"]
+        return result
+
+    def forget_completed_main(exec_id):
+        if exec_id == main_exec.get("id"):
+            raise docker.errors.NotFound("synthetic expired exec metadata")
+        return inspect(exec_id)
+
+    def timeout_first_receipt(command, **kwargs):
+        nonlocal receipt_reads
+        if 'cat -- "$1/settled"' in str(command):
+            receipt_reads += 1
+            if receipt_reads == 1:
+                raise requests.ReadTimeout("synthetic Docker daemon timeout")
+        return control(command, **kwargs)
+
+    monkeypatch.setattr(container.client.api, "exec_create", remember_main)
+    monkeypatch.setattr(container.client.api, "exec_inspect", forget_completed_main)
+    monkeypatch.setattr(container, "exec_run", timeout_first_receipt)
+    result = execute(["bash", "-c", f"printf RECOVERED; exit {exit_code}"], timeout=5)
+    assert result[:3] == ("RECOVERED", exit_code, False)
+    assert receipt_reads >= 2
+    assert (
+        container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
+        == 1
+    )
+
+
 def test_cancel_before_remote_start_preserves_no_dispatch(
     container, execute, monkeypatch
 ):
@@ -396,7 +519,7 @@ def slow_receipt_publication(monkeypatch):
     # Redirection opens the destination before the builtin writes bytes. Widen
     # that window without a child process: a sleeping child would itself keep
     # group_has_live true and accidentally hide premature anchor termination.
-    marker = '    code=$?\n'
+    marker = "    code=$?\n"
     supervisor = docker_utils._EXEC_SUPERVISOR
     assert supervisor.count(marker) == 1
     delay = r"""
@@ -417,10 +540,14 @@ def test_slow_receipt_publication_preserves_exit_code(
     container, execute, slow_receipt_publication, exit_code
 ):
     result = execute(["bash", "-c", f"printf DONE; exit {exit_code}"], timeout=10)
-    assert result[:3] == ("DONEPUBLISHING\n", exit_code, False)
-    assert container.exec_run(
-        ["bash", "-c", 'compgen -G "/tmp/sforge-exec-*"']
-    ).exit_code == 1
+    # Docker multiplexes stdout and stderr independently, so their cross-stream
+    # ordering is not stable even though both streams are fully drained.
+    assert result[0] in ("DONEPUBLISHING\n", "PUBLISHING\nDONE")
+    assert result[1:3] == (exit_code, False)
+    assert (
+        container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
+        == 1
+    )
 
 
 def test_cancel_during_receipt_publication_cleans_partial_file(
@@ -435,22 +562,24 @@ def test_cancel_during_receipt_publication_cleans_partial_file(
     result = execute(["true"], timeout=10, shutdown_event=stop, on_chunk=on_chunk)
     assert result[1:3] == (-1, True)
     assert stop.is_set()
-    assert container.exec_run(
-        ["bash", "-c", 'compgen -G "/tmp/sforge-exec-*"']
-    ).exit_code == 1
-
+    assert (
+        container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
+        == 1
+    )
 
 
 def test_receipt_publication_failure_is_nonzero(container, execute, monkeypatch):
     supervisor = docker_utils._EXEC_SUPERVISOR
-    marker = '    code=$?\n'
+    marker = "    code=$?\n"
     assert supervisor.count(marker) == 1
     monkeypatch.setattr(
-        docker_utils, "_EXEC_SUPERVISOR",
-        supervisor.replace(marker, marker + '    mv() { return 1; }\n'),
+        docker_utils,
+        "_EXEC_SUPERVISOR",
+        supervisor.replace(marker, marker + "    mv() { return 1; }\n"),
     )
     result = execute(["printf", "DONE"], timeout=5)
     assert result[:3] == ("DONE", 125, False)
-    assert container.exec_run(
-        ["bash", "-c", 'compgen -G "/tmp/sforge-exec-*"']
-    ).exit_code == 1
+    assert (
+        container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
+        == 1
+    )
