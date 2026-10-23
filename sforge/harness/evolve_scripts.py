@@ -38,8 +38,9 @@ from __future__ import annotations
 def generate_submit_script() -> str:
     """Generate the sforge-submit bash script.
 
-    Submits via POST to the token-based endpoint and polls for results.
-    The server manages task_id, run_id, and round counters.
+    Submits through a run-scoped feedback relay and polls for results. The
+    host retains judge credentials; the relay manages task_id, run_id, and
+    round counters without exposing broader evaluator authority to the agent.
 
     Flags:
       --details, -d    submit and show detailed per-test results
@@ -101,17 +102,12 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-JUDGE_URL="${SFORGE_JUDGE_URL}"
-TOKEN="${SFORGE_TOKEN}"
+FEEDBACK_URL="${SFORGE_FEEDBACK_URL}"
 PATCH_DIR="${SFORGE_PATCH_DIR:-$(pwd)}"
 STATE_FILE="/tmp/sforge_state.json"
 
-if [ -z "$JUDGE_URL" ]; then
-    echo "ERROR: SFORGE_JUDGE_URL not set" >&2
-    exit 1
-fi
-if [ -z "$TOKEN" ]; then
-    echo "ERROR: SFORGE_TOKEN not set" >&2
+if [ -z "$FEEDBACK_URL" ]; then
+    echo "ERROR: SFORGE_FEEDBACK_URL not set" >&2
     exit 1
 fi
 
@@ -147,7 +143,7 @@ get_json() {
 }
 
 if [ "$LIST_MODE" -eq 1 ]; then
-    HIST=$(get_json "$JUDGE_URL/api/v1/history?token=$TOKEN")
+    HIST=$(get_json "$FEEDBACK_URL/history")
     if ! echo "$HIST" | jq -e '.entries | type == "array"' >/dev/null; then
         echo "ERROR: Malformed submission history" >&2
         exit 1
@@ -194,12 +190,12 @@ if [ "$LIST_MODE" -eq 1 ]; then
 fi
 
 if [ -n "$SUBMISSION_ID" ]; then
-    # Respect token-visible history before reading a guessed ID; don't expose
+    # Respect relay-visible history before reading a guessed ID; don't expose
     # another run's result or reveal host-only automatic evaluations.
-    HIST=$(get_json "$JUDGE_URL/api/v1/history?token=$TOKEN")
+    HIST=$(get_json "$FEEDBACK_URL/history")
     ROUND_ID=$(echo "$HIST" | jq -r --arg sid "$SUBMISSION_ID" '.entries[]? | select(.type == "submission" and .submission_id == $sid) | .round // empty')
     if [ -z "$ROUND_ID" ]; then
-        echo "ERROR: Submission ID is not in this token's visible history" >&2
+        echo "ERROR: Submission ID is not in this relay's visible history" >&2
         exit 1
     fi
     echo "  Reading existing submission: $SUBMISSION_ID ($ROUND_ID)"
@@ -233,8 +229,7 @@ echo ""
 
 # ── Submit + poll ──
 
-if ! HTTP_CODE=$(curl -sS -o "$REQUEST_TMP/submit.json" -w '%{http_code}' -m 120 -X POST "$JUDGE_URL/api/v1/submit" \
-    -F "token=$TOKEN" \
+if ! HTTP_CODE=$(curl -sS -o "$REQUEST_TMP/submit.json" -w '%{http_code}' -m 120 -X POST "$FEEDBACK_URL/submit" \
     -F "archive=@$ARCHIVE_FILE"); then
     echo "ERROR: Submission response lost; acceptance is unknown. Do not automatically resubmit." >&2
     echo "Use sforge-submit --list, then --result ID to recover an accepted result." >&2
@@ -292,7 +287,7 @@ if [ "$NO_WAIT" -eq 0 ]; then
     echo "  Waiting for test results..."
 fi
 for _ in $(seq 1 720); do
-    RESULT=$(get_json "$JUDGE_URL/api/v1/result/$SUBMISSION_ID")
+    RESULT=$(get_json "$FEEDBACK_URL/result/$SUBMISSION_ID")
     STATUS=$(echo "$RESULT" | jq -r '.status // empty')
     if [ "$STATUS" = "completed" ] || [ "$STATUS" = "error" ]; then
         break

@@ -91,7 +91,9 @@ def judge(tmp_path, monkeypatch):
         "submission_cooldown": 3600, "max_agent_submissions": 3,
     }, timeout=5)
     response.raise_for_status()
-    token = response.json()["token"]
+    registration = response.json()
+    token = registration["token"]
+    relay_id = registration["feedback_relay_id"]
     patch = tmp_path / "patch"
     patch.mkdir()
     (patch / "answer.txt").write_text("synthetic answer")
@@ -101,15 +103,16 @@ def judge(tmp_path, monkeypatch):
     script.write_text(generate_submit_script().replace("/tmp/sforge_state.json", str(cache)))
     subprocess.run(["bash", "-n", str(script)], check=True)
 
-    def run(*args, judge_url=url, submit_token=token, timeout=20):
-        env = dict(os.environ, SFORGE_JUDGE_URL=judge_url, SFORGE_TOKEN=submit_token,
+    def run(*args, judge_url=url, feedback_relay_id=relay_id, timeout=20):
+        env = dict(os.environ,
+                   SFORGE_FEEDBACK_URL=f"{judge_url}/api/v1/feedback/{feedback_relay_id}",
                    SFORGE_PATCH_DIR=str(patch), NO_PROXY="127.0.0.1,localhost")
         return subprocess.run(["bash", str(script), *args], env=env,
                               capture_output=True, text=True, timeout=timeout)
 
     state = states[0]
     try:
-        yield SimpleNamespace(run=run, state=state, token=token, http=http,
+        yield SimpleNamespace(run=run, state=state, token=token, relay_id=relay_id, http=http,
                               url=url, patch=patch, cache=cache,
                               grade_started=grade_started, grade_release=grade_release,
                               graded_answers=graded_answers)
@@ -128,6 +131,50 @@ def accepted_id(judge):
     entries = judge.state.get_run_history("run", "example")["entries"]
     assert len(entries) == 1
     return entries[0]["submission_id"]
+
+
+def test_relay_is_run_scoped_and_raw_result_requires_host_token(judge):
+    submitted = judge.run("--no-wait")
+    assert submitted.returncode == 0, submitted.stderr
+    sid = accepted_id(judge)
+    base = f"{judge.url}/api/v1/feedback/{judge.relay_id}"
+
+    history = judge.http.get(base + "/history", timeout=5)
+    assert history.status_code == 200
+    assert [entry["submission_id"] for entry in history.json()["entries"]] == [sid]
+    assert judge.http.get(base + f"/result/{sid}", timeout=5).status_code == 200
+
+    other_token = judge.state.register_session("example", "other")
+    other_relay = judge.state.feedback_relay_id(other_token)
+    assert other_relay != other_token
+    denied = judge.http.get(
+        f"{judge.url}/api/v1/feedback/{other_relay}/result/{sid}", timeout=5,
+    )
+    assert denied.status_code == 404
+    forced_auto = judge.http.post(
+        f"{judge.url}/api/v1/feedback/{other_relay}/submit",
+        data={"kind": "auto"},
+        files={"archive": ("candidate.tar.gz", b"synthetic")}, timeout=5,
+    )
+    assert forced_auto.status_code == 200
+    assert forced_auto.json()["round_id"] == "agent-1"
+
+    auto = judge.state.submit("example", b"not graded", "run", "auto-1")
+    assert judge.http.get(base + f"/result/{auto}", timeout=5).status_code == 404
+    assert judge.http.get(
+        judge.url + f"/api/v1/result/{sid}", timeout=5,
+    ).status_code == 401
+    assert judge.http.get(
+        judge.url + f"/api/v1/result/{sid}",
+        params={"token": other_token}, timeout=5,
+    ).status_code == 404
+    assert judge.http.get(
+        judge.url + f"/api/v1/result/{sid}",
+        params={"token": judge.token}, timeout=5,
+    ).status_code == 200
+
+    script = generate_submit_script()
+    assert "SFORGE_TOKEN" not in script and "SFORGE_JUDGE_URL" not in script
 
 
 def test_read_result_preserves_full_feedback_and_submission_opportunity(judge):
@@ -273,7 +320,9 @@ def drop_one_reply(judge, path):
             response = judge.http.request(self.command, judge.url + self.path,
                 data=self.rfile.read(size) if size else None,
                 headers={"Content-Type": self.headers.get("Content-Type", "")}, timeout=5)
-            matches = self.path == path or (path == "result" and self.path.startswith("/api/v1/result/"))
+            matches = self.path.endswith(path) or (
+                path == "result" and "/result/" in self.path
+            )
             if matches and not self.server.dropped:
                 self.server.dropped = True
                 self.close_connection = True
@@ -304,12 +353,12 @@ def drop_one_reply(judge, path):
         assert not thread.is_alive()
 
 
-@pytest.mark.parametrize("path", ["/api/v1/submit", "result"])
+@pytest.mark.parametrize("path", ["/submit", "result"])
 def test_lost_reply_recovers_from_visible_history_without_resubmit(judge, path):
     with drop_one_reply(judge, path) as (url, gateway):
         submitted = judge.run(judge_url=url)
         assert gateway.dropped and submitted.returncode != 0
-        if path == "/api/v1/submit":
+        if path == "/submit":
             assert "acceptance is unknown" in submitted.stderr
         assert not judge.cache.exists()
         sid = accepted_id(judge)
@@ -325,10 +374,11 @@ def test_lost_reply_recovers_from_visible_history_without_resubmit(judge, path):
 def test_token_history_errors_and_other_run_ids_are_not_empty_success(judge, read_flags):
     assert judge.run().returncode == 0
     sid = accepted_id(judge)
-    denied = judge.run("--list", submit_token="invalid")
-    assert denied.returncode != 0 and "HTTP 401" in denied.stderr
+    denied = judge.run("--list", feedback_relay_id="invalid")
+    assert denied.returncode != 0 and "HTTP 404" in denied.stderr
     assert "Total submissions: 0" not in denied.stdout
     other = judge.state.register_session("example", "other")
+    other_relay = judge.state.feedback_relay_id(other)
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w:gz") as tar:
         content = b"synthetic answer"
@@ -336,8 +386,12 @@ def test_token_history_errors_and_other_run_ids_are_not_empty_success(judge, rea
         info.size = len(content)
         tar.addfile(info, io.BytesIO(content))
     auto = judge.state.submit("example", archive.getvalue(), "run", "auto-1")
-    for token, requested in ((other, sid), (judge.token, "unknown"), (judge.token, auto)):
-        denied = judge.run("--result", requested, *read_flags, submit_token=token)
+    for relay_id, requested in (
+        (other_relay, sid), (judge.relay_id, "unknown"), (judge.relay_id, auto),
+    ):
+        denied = judge.run(
+            "--result", requested, *read_flags, feedback_relay_id=relay_id,
+        )
         assert denied.returncode != 0 and "visible history" in denied.stderr
     assert judge.state.resolve_token(judge.token)["next_agent"] == 2
 

@@ -291,7 +291,10 @@ def test_nine_run_overlap_on_real_http(tmp_path, monkeypatch, limit, second_stat
             assert state.resolve_token(tokens[-1])["next_agent"] == 1
         sid = accepted[0][0]
         before = state.resolve_token(tokens[0])
-        assert requests.get(base + "/api/v1/result/" + sid, timeout=3).status_code == 200
+        assert requests.get(
+            base + "/api/v1/result/" + sid,
+            params={"token": tokens[0]}, timeout=3,
+        ).status_code == 200
         assert requests.get(base + "/api/v1/history", params={"token": tokens[0]}, timeout=3).status_code == 200
         assert state.resolve_token(tokens[0]) == before
     finally:

@@ -146,7 +146,9 @@ def test_http_registration_override_uses_app_factory(tmp_path, output, expected)
         submission_id = submission.json()["submission_id"]
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            result = client.get(f"/api/v1/result/{submission_id}").json()
+            result = client.get(
+                f"/api/v1/result/{submission_id}", params={"token": token},
+            ).json()
             if result["status"] in ("completed", "error"):
                 break
             time.sleep(0.01)

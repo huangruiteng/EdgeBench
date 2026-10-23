@@ -145,7 +145,10 @@ def harness(tmp_path, monkeypatch):
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             if self.path.endswith("/register"):
-                self.reply(200, {"token": "synthetic-session"})
+                self.reply(200, {
+                    "token": "synthetic-session",
+                    "feedback_relay_id": "synthetic-relay",
+                })
             elif self.path.endswith("/submit"):
                 state.submit_entered.set()
                 if not state.release_submit.wait(timeout=2):

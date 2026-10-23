@@ -157,6 +157,7 @@ class RegisterRequest(BaseModel):
 
 class RegisterResponse(BaseModel):
     token: str
+    feedback_relay_id: str
 
 
 class SubmitResponse(BaseModel):
@@ -859,6 +860,10 @@ class JudgeState:
             "task_id": task_id,
             "run_id": run_id,
             "registration_id": uuid.uuid4().hex,
+            # The judge token stays with the host. The work container receives
+            # only this route, whose handlers expose the documented agent
+            # feedback surface for this one registration.
+            "feedback_relay_id": secrets.token_hex(16),
             "next_agent": 1,
             "next_auto": 1,
             "judge_cpu_limit": judge_cpu_limit,
@@ -938,6 +943,26 @@ class JudgeState:
             if info is None:
                 raise KeyError("Invalid token")
             return dict(info)
+
+    def resolve_feedback_relay(self, relay_id: str) -> tuple[str, dict]:
+        """Resolve one opaque relay route to its host-held judge authority."""
+        with self._tokens_lock:
+            matches = [
+                (token, info)
+                for token, info in self.tokens.items()
+                if info.get("feedback_relay_id") == relay_id
+            ]
+            if len(matches) != 1:
+                raise KeyError("Invalid feedback relay")
+            token, info = matches[0]
+            return token, dict(info)
+
+    def feedback_relay_id(self, token: str) -> str:
+        info = self.resolve_token(token)
+        relay_id = info.get("feedback_relay_id")
+        if not isinstance(relay_id, str) or not relay_id:
+            raise KeyError("Feedback relay unavailable")
+        return relay_id
 
     @staticmethod
     def _agent_cooldown_wait(info: dict, now: float) -> int:
@@ -1052,6 +1077,51 @@ class JudgeState:
             "auto_submissions": sum(1 for e in sub_entries if (e.get("round") or "").startswith("auto-")),
             "entries": entries,
         }
+
+    def get_agent_history(self, token: str) -> dict:
+        """Project only feedback intentionally visible to the current solver."""
+        info = self.resolve_token(token)
+        full = self.get_run_history(info["run_id"], info["task_id"])
+        availability = self.agent_submission_availability(token)
+        agent_entries = [
+            entry for entry in full.get("entries", [])
+            if (entry.get("round") or "").startswith("agent-")
+        ]
+        task_spec = self.tasks.get(info["task_id"])
+        policy = task_spec.judge.selection if task_spec else "pass_rate_first"
+        direction = task_spec.judge.score_direction if task_spec else "maximize"
+        best = select_best(agent_entries, direction, policy)
+        return {
+            "run_id": info["run_id"],
+            "best_score": best["best_score"],
+            "best_pass_rate": best["best_pass_rate"],
+            "best_round": best["best_round"],
+            "agent_submissions": sum(
+                1 for entry in agent_entries if entry.get("type") == "submission"
+            ),
+            "auto_submissions": 0,
+            "agent_submission_availability": availability,
+            "entries": agent_entries,
+        }
+
+    def get_result_for_token(
+        self, token: str, submission_id: str, *, agent_only: bool = False,
+    ) -> dict | None:
+        """Return a result only when the submission belongs to this registration."""
+        info = self.resolve_token(token)
+        result = self.get_result(submission_id)
+        visible = bool(
+            result
+            and result.get("run_id") == info["run_id"]
+            and result.get("task_id") == info["task_id"]
+            and (
+                not agent_only
+                or (result.get("round") or "").startswith("agent-")
+            )
+        )
+        if not visible:
+            return None
+        return result
 
     def load_tasks(self) -> None:
         benchmark = load_benchmark(self.config.tasks_dir)
@@ -1636,10 +1706,7 @@ def create_app(
         from sforge.harness.checkpoint import install_routes
         install_routes(app, state)
 
-    @app.get("/api/v1/result/{submission_id}")
-    def get_result(submission_id: str) -> ResultResponse:
-        """Get result of an async submission."""
-        result = state.get_result(submission_id)
+    def result_response(submission_id: str, result: dict | None) -> ResultResponse:
         if result is None:
             raise HTTPException(status_code=404, detail="Submission not found")
         return ResultResponse(
@@ -1648,6 +1715,19 @@ def create_app(
             report=result["report"],
             error=result["error"],
         )
+
+    @app.get("/api/v1/result/{submission_id}")
+    def get_result(
+        submission_id: str, token: str | None = Query(None),
+    ) -> ResultResponse:
+        """Host API: get a result only within the token's registered run."""
+        if not token:
+            raise HTTPException(status_code=401, detail="Token required")
+        try:
+            result = state.get_result_for_token(token, submission_id)
+        except KeyError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return result_response(submission_id, result)
 
     @app.post("/api/v1/register")
     def register(req: RegisterRequest) -> RegisterResponse:
@@ -1670,7 +1750,10 @@ def create_app(
                 e2b_template_namespace=req.e2b_template_namespace,
                 e2b_sandbox_ttl=req.e2b_sandbox_ttl,
             )
-            return RegisterResponse(token=token)
+            return RegisterResponse(
+                token=token,
+                feedback_relay_id=state.feedback_relay_id(token),
+            )
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -1725,29 +1808,56 @@ def create_app(
         if admin_secret == state.admin_secret:
             return full
         try:
-            availability = state.agent_submission_availability(token)
+            return state.get_agent_history(token)
         except KeyError:
             raise HTTPException(status_code=401, detail="Invalid token")
-        # Filter to agent-only view: hide auto-eval entries
-        agent_entries = [
-            e for e in full.get("entries", [])
-            if not (e.get("round") or "").startswith("auto-")
-        ]
-        resolved_tid = info["task_id"]
-        task_spec = state.tasks.get(resolved_tid) if resolved_tid else None
-        policy = task_spec.judge.selection if task_spec else "pass_rate_first"
-        direction = task_spec.judge.score_direction if task_spec else "maximize"
-        best = select_best(agent_entries, direction, policy)
-        return {
-            "run_id": info["run_id"],
-            "best_score": best["best_score"],
-            "best_pass_rate": best["best_pass_rate"],
-            "best_round": best["best_round"],
-            "agent_submissions": sum(1 for e in agent_entries if e.get("type") == "submission"),
-            "auto_submissions": 0,
-            "agent_submission_availability": availability,
-            "entries": agent_entries,
-        }
+
+    # Solver-facing capability relay. The opaque route selects exactly one
+    # registration; no judge token or admin authority enters the work container.
+    @app.post("/api/v1/feedback/{relay_id}/submit")
+    def feedback_submit(
+        relay_id: str, archive: UploadFile = File(...),
+    ) -> SubmitResponse:
+        try:
+            token, _ = state.resolve_feedback_relay(relay_id)
+            submission_id, round_id, remaining = state.submit_for_token(
+                token, archive.file.read(), "agent",
+            )
+            return SubmitResponse(
+                submission_id=submission_id,
+                round_id=round_id,
+                status=SubmissionStatus.QUEUED,
+                remaining_submissions=remaining,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Feedback relay not found")
+        except (SubmissionBudgetExceeded, SubmissionCooldownActive) as exc:
+            raise HTTPException(status_code=429, detail=str(exc))
+        except JudgeCapacityExceeded as exc:
+            raise HTTPException(
+                status_code=503, detail=str(exc), headers={"Retry-After": "5"},
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+    @app.get("/api/v1/feedback/{relay_id}/history")
+    def feedback_history(relay_id: str) -> dict:
+        try:
+            token, _ = state.resolve_feedback_relay(relay_id)
+            return state.get_agent_history(token)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Feedback relay not found")
+
+    @app.get("/api/v1/feedback/{relay_id}/result/{submission_id}")
+    def feedback_result(relay_id: str, submission_id: str) -> ResultResponse:
+        try:
+            token, _ = state.resolve_feedback_relay(relay_id)
+            result = state.get_result_for_token(
+                token, submission_id, agent_only=True,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Feedback relay not found")
+        return result_response(submission_id, result)
 
     # --- Game session routes ---
 

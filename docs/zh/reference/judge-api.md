@@ -16,7 +16,10 @@ http://localhost:8080
 
 ## 认证机制
 
-Judge API 使用**基于 Token 的会话模型**。在提交之前，客户端必须先注册会话以获取 Token。Token 编码了任务 ID、运行 ID 和自增的轮次计数器。
+控制器 API 使用**基于 Token 的会话模型**。控制器注册会话后把 Judge
+Token 保留在宿主机；work 容器只接收 runner 提供的、绑定当前注册的反馈
+relay URL。relay 仅允许 Agent 提交、Agent 可见历史，以及读取同一注册已接受
+的 Agent 提交结果。
 
 ## 接口列表
 
@@ -56,7 +59,8 @@ Content-Type: application/json
 
 ```json
 {
-  "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+  "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "feedback_relay_id": "11223344556677889900aabbccddeeff"
 }
 ```
 
@@ -69,7 +73,7 @@ Token 是一个 32 字符的十六进制字符串，内部维护任务 ID、运�
 所有 checkpoint 接口都要求 JSON 正文中的当前评测控制器 `admin_secret`。Agent 的提交 token 只能标识捕获来源，不能授权捕获或恢复。迁往另一控制器时，只把获授权的 `logs/checkpoints/` 库转入其自身日志目录，使用新控制器独立生成的管理密钥；不要复制原管理密钥文件或会话 token。
 
 - `POST /api/v1/checkpoint/capture`：正文包含 `token`、`admin_secret`，可选 `capture_id`（调用者生成的 32 位十六进制操作 ID）。同一注册重试同一 ID 返回首次捕获的点，不采用后来的提交，也不重复保存；其他注册不能复用。省略该字段表示新的手动捕获。响应包含 `checkpoint_id`、`manifest_sha256`、题目/来源 run、已用轮次/剩余冷却，以及原生选优的 incumbent 轮次、大小和摘要。私有 capsule 保留已公开的 agent 历史、完整结果及被选中的归档，不包含提交或管理 token。归档按原始字节保留，不解包。
-- `POST /api/v1/checkpoint/restore`：正文包含 `checkpoint_id`、捕获响应中的 `manifest_sha256`、全新的 `run_id` 和当前 `admin_secret`。响应返回新的提交 token。通过原有 `/api/v1/history?token=...` 和 `/api/v1/result/{submission_id}` 读回。历史结果使用新的查询 ID，原报告保持不变；`logs/runs/新run/checkpoint-origin.json` 保存来源映射，incumbent 保留原轮次。
+- `POST /api/v1/checkpoint/restore`：正文包含 `checkpoint_id`、捕获响应中的 `manifest_sha256`、全新的 `run_id` 和当前 `admin_secret`。响应返回新的提交 token 和反馈 relay。控制器通过 `/api/v1/history?token=...` 和 `/api/v1/result/{submission_id}?token=...` 读回。历史结果使用新的查询 ID，原报告保持不变；`logs/runs/新run/checkpoint-origin.json` 保存来源映射，incumbent 保留原轮次。
 
 恢复不会评测或多消费一轮。后续提交仍由原生 `consume_round`、预算、冷却及选优规则决定。冷却在新注册发布时，从捕获时剩余的**时长**重新计时；离线等待和 capsule 物化既不会补发机会，也不会消耗这段时长；旧 capsule 不包含来源后来取得的提升。
 
@@ -117,7 +121,7 @@ kind: agent
 轮询提交的评测结果。
 
 ```http
-GET /api/v1/result/{submission_id}
+GET /api/v1/result/{submission_id}?token={host_session_token}
 ```
 
 **响应（排队中/运行中）：**
@@ -172,6 +176,21 @@ GET /api/v1/result/{submission_id}
 | `completed` | 评测完成，报告可用 |
 | `error` | 评测失败（容器崩溃、超时等） |
 
+### Agent 反馈 Relay
+
+runner 在 work 容器内把 `SFORGE_FEEDBACK_URL` 设置为
+`/api/v1/feedback/{feedback_relay_id}`。生成的 `sforge-submit` 只调用三个无需
+Judge 凭据、且绑定当前注册的接口：
+
+```http
+POST {SFORGE_FEEDBACK_URL}/submit
+GET  {SFORGE_FEEDBACK_URL}/history
+GET  {SFORGE_FEEDBACK_URL}/result/{submission_id}
+```
+
+relay 固定以 `agent` 身份提交，隐藏 auto-eval 历史，并拒绝其他 run 或宿主机
+auto-eval 的结果 ID。原始控制器 result 接口仍要求宿主机持有的会话 token。
+
 ### 提交快照与读取结果
 
 Judge 评测提交时上传的归档。提交被接受后，继续修改工作目录不会改变这次提交。
@@ -184,7 +203,7 @@ sforge-submit --result <submission_id> --no-wait --details
 ```
 
 新提交使用 `--no-wait` 时，在提交被接受后成功退出，此时尚未读取或缓存分数。
-与 `--result ID` 同用时，先核验 Token 可见历史，再查询一次结果：`queued` 或
+与 `--result ID` 同用时，先核验 relay 可见历史，再查询一次结果：`queued` 或
 `running` 会成功返回明确的 pending 状态，不输出分数、不修改缓存；终态结果沿用
 阻塞查询的反馈与错误处理。pending 的成功退出只表示查询成功，不表示候选通过验收。
 可以先继续有用的独立工作，再查询同一 ID。
@@ -201,7 +220,7 @@ sforge-submit --result <submission_id> --details
 ```
 
 使用接受提交时输出的 ID；若接受响应丢失，先通过 `--list` 查找。
-恢复读取仅接受当前 Token 可见历史中的 ID，保留原轮次、分数和公开详情，
+恢复读取仅接受当前 relay 可见历史中的 ID，保留原轮次、分数和公开详情，
 不打包当前工作目录、不消耗新的提交次数，也不改变冷却时钟。
 单独使用 `--details` 仍会提交新代码；读取原详情应使用 `--result ID --details`。
 
@@ -382,7 +401,7 @@ SUBMISSION_ID=$(curl -s -X POST http://localhost:8080/api/v1/submit \
 echo "Submission: $SUBMISSION_ID"
 
 # 3. 轮询结果（重复直到 status 为 "completed" 或 "error"）
-curl -s http://localhost:8080/api/v1/result/$SUBMISSION_ID | jq .
+curl -s "http://localhost:8080/api/v1/result/$SUBMISSION_ID?token=$TOKEN" | jq .
 
 # 4. 查看运行历史
 curl -s "http://localhost:8080/api/v1/history?token=$TOKEN" | jq .
@@ -392,10 +411,10 @@ curl -s "http://localhost:8080/api/v1/history?token=$TOKEN" | jq .
 
 ```bash
 while true; do
-  STATUS=$(curl -s http://localhost:8080/api/v1/result/$SUBMISSION_ID | jq -r '.status')
+  STATUS=$(curl -s "http://localhost:8080/api/v1/result/$SUBMISSION_ID?token=$TOKEN" | jq -r '.status')
   echo "Status: $STATUS"
   if [ "$STATUS" = "completed" ] || [ "$STATUS" = "error" ]; then
-    curl -s http://localhost:8080/api/v1/result/$SUBMISSION_ID | jq .
+    curl -s "http://localhost:8080/api/v1/result/$SUBMISSION_ID?token=$TOKEN" | jq .
     break
   fi
   sleep 5

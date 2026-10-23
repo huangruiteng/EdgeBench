@@ -140,7 +140,10 @@ def test_http_backpressure_auth_and_result_contract(tmp_path, monkeypatch):
             assert invalid.status_code == 401
             auto = client.post('/api/v1/submit', data={'token': token, 'kind': 'auto'}, files={'archive': ('a', b'x')})
             assert auto.status_code == 403
-            result = client.get('/api/v1/result/' + first.json()['submission_id'])
+            result = client.get(
+                '/api/v1/result/' + first.json()['submission_id'],
+                params={'token': token},
+            )
             assert result.json()['status'] == 'running'
             assert app.state.judge.resolve_token(token)['next_agent'] == 2
         finally:

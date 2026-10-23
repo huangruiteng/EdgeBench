@@ -142,8 +142,11 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
             timeout=20,
         )
 
-    def result(url, sid):
-        response = requests.get(url + "/api/v1/result/" + sid, timeout=10)
+    def result(url, token, sid):
+        response = requests.get(
+            url + "/api/v1/result/" + sid,
+            params={"token": token}, timeout=10,
+        )
         response.raise_for_status()
         packet = response.json()
         return packet if packet["status"] in ("completed", "error") else None
@@ -175,7 +178,9 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
             )
             assert pending.status_code == 409
             release.set()
-            graded = wait_for(lambda: result(source_url, first.json()["submission_id"]))
+            graded = wait_for(
+                lambda: result(source_url, token, first.json()["submission_id"])
+            )
             assert graded["status"] == "completed" and graded["report"]["score"] == 7
             point_response = post(
                 source_url,
@@ -255,6 +260,7 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
                 )
                 recovered.raise_for_status()
                 fresh = recovered.json()["token"]
+                feedback_relay_id = recovered.json()["feedback_relay_id"]
                 assert (
                     fresh_state.tokens,
                     fresh_state.submissions,
@@ -282,7 +288,8 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
                 cli = tmp_path / "sforge-submit"
                 cli.write_text(generate_submit_script())
                 listed = subprocess.run(["bash", str(cli), "--list"],
-                    env={**os.environ, "SFORGE_JUDGE_URL": url, "SFORGE_TOKEN": fresh,
+                    env={**os.environ,
+                         "SFORGE_FEEDBACK_URL": url + "/api/v1/feedback/" + feedback_relay_id,
                          "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"},
                     capture_output=True, text=True, timeout=20)
                 assert listed.returncode == 0, listed.stderr
@@ -292,7 +299,7 @@ def test_real_native_checkpoint_continues_without_regrading_or_refill(
                 assert (fresh_state.tokens, fresh_state.submissions, fresh_state.run_history) == published
                 sid = history["entries"][0]["submission_id"]
                 assert sid != first.json()["submission_id"]
-                assert result(url, sid)["report"] == graded["report"]
+                assert result(url, fresh, sid)["report"] == graded["report"]
                 selected = (
                     new_config.log_dir
                     / f"runs/{destination_run}/fixture/submissions/agent-1/submission.tar.gz"
@@ -328,13 +335,14 @@ raw=io.BytesIO()
 with tarfile.open(fileobj=raw,mode='w:gz') as archive:
     archive.add('/tmp/candidate.json',arcname='candidate.json')
 boundary='native-fixture-boundary'
-body=('--'+boundary+'\\r\\nContent-Disposition: form-data; name="token"\\r\\n\\r\\n'+os.environ['SFORGE_TOKEN']+'\\r\\n--'+boundary+'\\r\\nContent-Disposition: form-data; name="archive"; filename="candidate.tar.gz"\\r\\nContent-Type: application/gzip\\r\\n\\r\\n').encode()+raw.getvalue()+('\\r\\n--'+boundary+'--\\r\\n').encode()
-url=os.environ['SFORGE_JUDGE_URL']
-request=urllib.request.Request(url+'/api/v1/submit',data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
+body=('--'+boundary+'\\r\\nContent-Disposition: form-data; name="archive"; filename="candidate.tar.gz"\\r\\nContent-Type: application/gzip\\r\\n\\r\\n').encode()+raw.getvalue()+('\\r\\n--'+boundary+'--\\r\\n').encode()
+url=os.environ['SFORGE_FEEDBACK_URL']
+assert 'SFORGE_TOKEN' not in os.environ
+request=urllib.request.Request(url+'/submit',data=body,headers={'Content-Type':'multipart/form-data; boundary='+boundary})
 reply=json.load(urllib.request.urlopen(request,timeout=15))
 assert reply['round_id']=='agent-2' and reply['remaining_submissions']==0
 for _ in range(200):
-    result=json.load(urllib.request.urlopen(url+'/api/v1/result/'+reply['submission_id'],timeout=5))
+    result=json.load(urllib.request.urlopen(url+'/result/'+reply['submission_id'],timeout=5))
     if result['status'] in ('completed','error'): break
     time.sleep(.1)
 assert result['status']=='completed' and result['report']['score']==3

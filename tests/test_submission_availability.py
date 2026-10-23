@@ -26,6 +26,7 @@ def harness(tmp_path, monkeypatch):
     state = judge.JudgeState(SForgeConfig(log_dir=tmp_path, tasks_dir=tmp_path / "tasks"))
     state.tokens["test-token"] = {
         "task_id": "example", "run_id": "sample", "next_agent": 3,
+        "feedback_relay_id": "test-relay",
         "next_auto": 2, "max_agent_submissions": 5,
         "submission_cooldown": 3600, "last_agent_submit_at": 9900.0,
         "judge_cpu_limit": None, "judge_mem_limit": None,
@@ -134,7 +135,7 @@ def test_generated_list_against_http(harness, tmp_path):
         if not shutil.which(tool):
             pytest.skip(f"CLI integration requires {tool}")
     state, app = harness
-    @app.get("/legacy/api/v1/history")
+    @app.get("/legacy/history")
     def legacy_history():
         return {"entries": [], "best_score": None, "best_pass_rate": 0.0}
     state.tokens["test-token"]["last_agent_submit_at"] = time.time()
@@ -150,8 +151,10 @@ def test_generated_list_against_http(harness, tmp_path):
         while not server.started and time.monotonic() < deadline:
             time.sleep(0.01)
         assert server.started
-        env = {**os.environ, "SFORGE_JUDGE_URL": f"http://127.0.0.1:{sock.getsockname()[1]}",
-               "SFORGE_TOKEN": "test-token", "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
+        base = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        env = {**os.environ,
+               "SFORGE_FEEDBACK_URL": base + "/api/v1/feedback/test-relay",
+               "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
         before = copy.deepcopy(state.tokens)
         result = subprocess.run(["bash", str(script), "--list"], env=env, capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, result.stderr
@@ -163,12 +166,13 @@ def test_generated_list_against_http(harness, tmp_path):
         state.tokens["test-token"].update(max_agent_submissions=2, last_agent_submit_at=0.0)
         exhausted = subprocess.run(["bash", str(script), "--list"], env=env, capture_output=True, text=True, timeout=10)
         assert exhausted.returncode == 0 and "budget exhausted" in exhausted.stdout
-        failed = subprocess.run(["bash", str(script), "--list"], env={**env, "SFORGE_TOKEN": "invalid"},
+        failed = subprocess.run(["bash", str(script), "--list"],
+                                env={**env, "SFORGE_FEEDBACK_URL": base + "/api/v1/feedback/invalid"},
                                 capture_output=True, text=True, timeout=10)
-        assert failed.returncode != 0 and "HTTP 401" in failed.stderr
+        assert failed.returncode != 0 and "HTTP 404" in failed.stderr
         assert "Submission History" not in failed.stdout
         legacy = subprocess.run(["bash", str(script), "--list"],
-                                env={**env, "SFORGE_JUDGE_URL": env["SFORGE_JUDGE_URL"] + "/legacy"},
+                                env={**env, "SFORGE_FEEDBACK_URL": base + "/legacy"},
                                 capture_output=True, text=True, timeout=10)
         assert legacy.returncode == 0 and "limits unavailable" in legacy.stdout
         assert "Cooldown: ready" not in legacy.stdout
