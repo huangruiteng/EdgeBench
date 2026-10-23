@@ -593,6 +593,7 @@ def run_agent(
     internet: bool = True,
     verbose: bool = False,
     shutdown_event: threading.Event | None = None,
+    grading_shutdown_event: threading.Event | None = None,
     max_submissions: int | None = None,
     submission_cooldown: int | None = None,
     restored_registration: RestoredRegistration | None = None,
@@ -622,6 +623,11 @@ def run_agent(
     registration and before container creation.  It is a host integration seam
     for read-only observers; the callback must never forward the token into the
     solver environment or persist it in run artifacts.
+
+    ``grading_shutdown_event`` lets an external controller stop solver work while
+    allowing already accepted evaluations to drain. When omitted, grading uses
+    ``shutdown_event`` as before. A caller that supplies a distinct event remains
+    responsible for setting it when scorer drain must also stop.
     """
     # Warm admission is explicit and does not invoke checkpoint restore itself.
     # The caller must admit the matching worker state and arrange its installation.
@@ -636,6 +642,9 @@ def run_agent(
         effective_timeout = agent.timeout
     if type(effective_timeout) is not int or effective_timeout <= 0:
         raise ValueError("Agent execution timeout must be a positive integer in seconds")
+    effective_grading_shutdown = (
+        shutdown_event if grading_shutdown_event is None else grading_shutdown_event
+    )
 
     log_dir = config.log_dir / "runs" / run_id / task_spec.task_id
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1139,7 +1148,7 @@ def run_agent(
             grading = _wait_for_grading(
                 host_judge_url, session_token, admin_secret,
                 eval_timeout=task_spec.judge.eval_timeout,
-                shutdown_event=shutdown_event, logger=logger,
+                shutdown_event=effective_grading_shutdown, logger=logger,
                 incomplete_reason=close_error,
             )
             history = _write_grading(log_dir, "game_history.json", grading, run_id)
@@ -1205,7 +1214,7 @@ def run_agent(
             grading = _wait_for_grading(
                 host_judge_url, session_token, admin_secret,
                 eval_timeout=task_spec.judge.eval_timeout,
-                shutdown_event=shutdown_event, logger=logger,
+                shutdown_event=effective_grading_shutdown, logger=logger,
                 incomplete_reason=None if auto_eval_finished else "auto_eval_active",
             )
             history = _write_grading(log_dir, "run_history.json", grading, run_id)
@@ -1267,7 +1276,8 @@ def run_agent(
         grading = (_wait_for_grading(
             host_judge_url, session_token, admin_secret,
             eval_timeout=task_spec.judge.eval_timeout,
-            shutdown_event=shutdown_event, logger=logger, incomplete_reason="interrupted",
+            shutdown_event=effective_grading_shutdown, logger=logger,
+            incomplete_reason="interrupted",
         ) if session_token is not None else _GradingResult(None, "unknown", "interrupted"))
         try:
             history_file = "game_history.json" if task_spec.game_mode else "run_history.json"
@@ -1315,7 +1325,7 @@ def run_agent(
                 grading = _wait_for_grading(
                     host_judge_url, session_token, admin_secret,
                     eval_timeout=task_spec.judge.eval_timeout,
-                    shutdown_event=shutdown_event, logger=logger,
+                    shutdown_event=effective_grading_shutdown, logger=logger,
                     incomplete_reason="harness_error",
                 )
             history_file = "game_history.json" if task_spec.game_mode else "run_history.json"
