@@ -39,6 +39,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
@@ -595,6 +596,7 @@ def run_agent(
     max_submissions: int | None = None,
     submission_cooldown: int | None = None,
     restored_registration: RestoredRegistration | None = None,
+    host_registration_callback: Callable[[str], None] | None = None,
 ) -> RunResult:
     """Run an agent on a task with iterative evaluation.
 
@@ -615,6 +617,11 @@ def run_agent(
     through its ordinary installation path. Judge recovery alone does not prove
     full worker continuity. This entry neither creates nor restores authority.
     Periodic auto-evaluation must be disabled for this agent-only continuation.
+
+    ``host_registration_callback`` receives the run-scoped judge token after
+    registration and before container creation.  It is a host integration seam
+    for read-only observers; the callback must never forward the token into the
+    solver environment or persist it in run artifacts.
     """
     # Warm admission is explicit and does not invoke checkpoint restore itself.
     # The caller must admit the matching worker state and arrange its installation.
@@ -754,6 +761,11 @@ def run_agent(
             session_token = registration["token"]
             feedback_relay_id = registration["feedback_relay_id"]
             logger.info("Registered session with judge server")
+
+        if host_registration_callback is not None:
+            if not isinstance(session_token, str) or not session_token:
+                raise RuntimeError("Judge registration did not return a session token")
+            host_registration_callback(session_token)
 
         if restored_execution is not None:
             restored_execution.remaining()

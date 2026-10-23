@@ -243,6 +243,23 @@ def test_long_evaluation_finishes_before_run_returns(harness, solver_timed_out):
     assert all(q.get("admin_secret") == ["synthetic-admin"] for q in harness.history_requests)
 
 
+def test_host_registration_callback_receives_token_without_solver_env(harness):
+    observed = []
+    original = harness.backend.exec_run_with_timeout
+
+    def capture_environment(*args, **kwargs):
+        if kwargs.get("log_file") is not None:
+            assert "SFORGE_TOKEN" not in kwargs["environment"]
+            assert kwargs["environment"]["SFORGE_FEEDBACK_URL"].endswith(
+                "/api/v1/feedback/synthetic-relay"
+            )
+        return original(*args, **kwargs)
+
+    harness.backend.exec_run_with_timeout = capture_environment
+    harness.run(host_registration_callback=observed.append)
+    assert observed == ["synthetic-session"]
+
+
 @pytest.mark.parametrize("failure", ["pending", "unavailable", "malformed"])
 def test_incomplete_grading_is_bounded_and_recorded(harness, failure):
     harness.task.judge.eval_timeout = 1
