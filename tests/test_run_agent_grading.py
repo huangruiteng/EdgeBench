@@ -328,6 +328,25 @@ def test_shutdown_event_stops_waiting_without_claiming_completion(harness):
     assert harness.clock.elapsed < 900
 
 
+def test_solver_stop_can_drain_accepted_grading_with_distinct_event(harness):
+    solver_stop = threading.Event()
+    grading_stop = SimpleNamespace(
+        is_set=lambda: False,
+        wait=harness.clock.sleep,
+    )
+    harness.backend.before_solver_return = solver_stop.set
+
+    result = harness.run(
+        shutdown_event=solver_stop,
+        grading_shutdown_event=grading_stop,
+    )
+
+    assert result.best_score == 99
+    assert result.grading_status == "complete"
+    execution = result.solver_execution["segments"][-1]
+    assert execution["stop_requested"] is True
+
+
 def test_harness_failure_retains_failure_and_nonfinal_history(harness):
     harness.backend.solver_error = RuntimeError("synthetic solver failure")
     result = harness.run()
