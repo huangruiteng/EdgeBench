@@ -171,6 +171,11 @@ class RestoredExecution:
             )
         if not isinstance(result.get("token"), str) or not result["token"]:
             raise ValueError("Restored registration has no live authority")
+        if (
+            not isinstance(result.get("feedback_relay_id"), str)
+            or not result["feedback_relay_id"]
+        ):
+            raise ValueError("Restored registration has no feedback relay")
         self.remaining()
         return {
             **result,

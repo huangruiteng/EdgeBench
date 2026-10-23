@@ -36,7 +36,8 @@ def test_startup_interrupt_preserves_history_and_cleanup(tmp_path, monkeypatch, 
         backend.exec_run_with_exit_code = lambda *a, **kw: SimpleNamespace(
             output="installed", timed_out=False, exit_code=0, elapsed_seconds=0)
     monkeypatch.setattr(runner.requests, "post", lambda *a, **kw: SimpleNamespace(
-        status_code=200, raise_for_status=lambda: None, json=lambda: {"token": "fixture-token"}))
+        status_code=200, raise_for_status=lambda: None,
+        json=lambda: {"token": "fixture-token", "feedback_relay_id": "fixture-relay"}))
     history = {"best_score": 7, "best_pass_rate": 1, "best_round": "agent-1",
         "agent_submissions": 1, "auto_submissions": 0, "entries": []}
     monkeypatch.setattr(runner.requests, "get", lambda *a, **kw: SimpleNamespace(

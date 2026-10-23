@@ -33,9 +33,10 @@ from test_judge_tcp_acceptance import (
 )
 
 
-def result_report(runtime, submission_id):
+def result_report(runtime, token, submission_id):
     response = requests.get(
-        runtime.url + "/api/v1/result/" + submission_id, timeout=5,
+        runtime.url + "/api/v1/result/" + submission_id,
+        params={"token": token}, timeout=5,
     )
     response.raise_for_status()
     return response.json()
@@ -63,7 +64,7 @@ def test_completed_history_retains_original_evaluation_outcome(
     rt.release.set()
     wait_until(lambda: not any(x["status"] in ("queued", "running") for x in rt.state.submissions.values()))
 
-    report = result_report(rt, sid)
+    report = result_report(rt, token, sid)
     # Existing native worker behavior removes only this rescaled-score field.
     expected = {k: v for k, v in original.items() if k != "score_0_100"}
     assert report["status"] == "completed" and report["report"] == expected
@@ -103,7 +104,7 @@ def test_legacy_report_omissions_are_not_filled_in(live_judge, fields):
         if key in fields:
             assert entry[key] == fields[key]
     assert entry["score"] == 0 and entry["valid"] is False
-    report = result_report(rt, submitted.json()["submission_id"])["report"]
+    report = result_report(rt, token, submitted.json()["submission_id"])["report"]
     assert report == {k: v for k, v in body.items() if k != "error"}
 
 
@@ -119,12 +120,12 @@ def test_pending_and_error_history_have_no_terminal_outcome(live_judge):
     assert sorted(e["status"] for e in pending["entries"]) == ["queued", "running"]
     for entry in pending["entries"]:
         assert all(key not in entry for key in ("score", "timed_out", "runtime_seconds"))
-        report = result_report(rt, entry["submission_id"])
+        report = result_report(rt, token, entry["submission_id"])
         assert report["report"] is None and report["status"] == entry["status"]
     assert len(history(rt, token, admin=False)["entries"]) == 1
     rt.release.set()
     wait_until(lambda: not any(x["status"] in ("queued", "running") for x in rt.state.submissions.values()))
-    failed = result_report(rt, first.json()["submission_id"])
+    failed = result_report(rt, token, first.json()["submission_id"])
     assert failed["status"] == "error" and failed["report"] is None
     agent = history(rt, token, admin=False)
     assert agent["best_score"] is None

@@ -16,7 +16,10 @@ All endpoints are prefixed with `/api/v1`.
 
 ## Authentication
 
-The Judge API uses a **token-based session model**. Before submitting, clients must register a session to obtain a token. The token encodes the task ID, run ID, and auto-incrementing round counters.
+The controller API uses a **token-based session model**. A controller registers
+a session and keeps the judge token on the host. Work containers receive only a
+run-scoped feedback relay URL, which exposes agent submit, agent-visible history,
+and results for accepted agent submissions from the same registration.
 
 ## Endpoints
 
@@ -56,7 +59,8 @@ Content-Type: application/json
 
 ```json
 {
-  "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+  "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+  "feedback_relay_id": "11223344556677889900aabbccddeeff"
 }
 ```
 
@@ -84,7 +88,7 @@ Content-Type: application/json
 {"checkpoint_id":"11111111111111111111111111111111","manifest_sha256":"CAPTURED_64_CHARACTER_SHA256","run_id":"fresh-branch","admin_secret":"CURRENT_CONTROLLER_SECRET"}
 ```
 
-The response issues a fresh submission token for `fresh-branch`. Read back using the existing `/api/v1/history?token=...` and `/api/v1/result/{submission_id}` endpoints. Retained results have fresh lookup IDs and unchanged original reports; `logs/runs/fresh-branch/checkpoint-origin.json` records their source mapping. The selected archive is retained under its original round. Restore performs **no evaluation**. The next `/submit` uses the existing native counter, budget, cooldown and selection rules. Cooldown resumes from the captured remaining **duration** when the fresh registration is published; offline waiting and capsule materialization do not refill evaluation opportunities or spend that duration. A later source improvement is absent from an earlier capsule.
+The response issues a fresh submission token and feedback relay for `fresh-branch`. Read back from the controller with `/api/v1/history?token=...` and `/api/v1/result/{submission_id}?token=...`. Retained results have fresh lookup IDs and unchanged original reports; `logs/runs/fresh-branch/checkpoint-origin.json` records their source mapping. The selected archive is retained under its original round. Restore performs **no evaluation**. The next `/submit` uses the existing native counter, budget, cooldown and selection rules. Cooldown resumes from the captured remaining **duration** when the fresh registration is published; offline waiting and capsule materialization do not refill evaluation opportunities or spend that duration. A later source improvement is absent from an earlier capsule.
 
 If the restore response is lost, call `POST /api/v1/checkpoint/restore-result` with the **same** JSON body (`checkpoint_id`, `manifest_sha256`, `run_id`, and current `admin_secret`). It returns the original response shape and the already published submission token. It does not allocate another registration, replay grading, or restart cooldown. Readback also remains valid after subsequent submissions and preserves their consumed opportunities. The existing origin marker must match and the registration must still be live; a missing, mismatched, partial or lost registration returns 409. Wrong admin authority returns 403, and malformed bodies return 422. A persisted origin marker alone cannot recreate credentials after a judge process restart. This recovery does not recover a runner's phase deadline: its controller must retain the original activation-time deadline and must not initialize a new duration on retry. A new `run_id` represents a different branch, not recovery of this response.
 
@@ -130,7 +134,7 @@ Submissions are processed asynchronously --- the server returns immediately with
 Poll for the result of a submission.
 
 ```http
-GET /api/v1/result/{submission_id}
+GET /api/v1/result/{submission_id}?token={host_session_token}
 ```
 
 **Response (queued/running):**
@@ -185,6 +189,22 @@ GET /api/v1/result/{submission_id}
 | `completed` | Grading finished, report is available |
 | `error` | Grading failed (container crash, timeout, etc.) |
 
+### Agent Feedback Relay
+
+The runner sets `SFORGE_FEEDBACK_URL` to
+`/api/v1/feedback/{feedback_relay_id}` inside the work container. The generated
+`sforge-submit` client uses these credential-free, registration-scoped routes:
+
+```http
+POST {SFORGE_FEEDBACK_URL}/submit
+GET  {SFORGE_FEEDBACK_URL}/history
+GET  {SFORGE_FEEDBACK_URL}/result/{submission_id}
+```
+
+The relay always submits as `agent`, omits auto-eval history, and rejects result
+IDs from another run or from host-side auto evaluation. The raw controller
+result endpoint requires the host session token.
+
 ### Submitting snapshots and reading results
 
 The judge evaluates the archive uploaded at submission time. Once accepted,
@@ -199,7 +219,7 @@ sforge-submit --result <submission_id> --no-wait --details
 
 For a new submission, `--no-wait` exits successfully on acceptance, without
 reading or caching a score. With `--result ID`, it checks the result once after
-verifying token-visible history: `queued` or `running` returns success with an
+verifying relay-visible history: `queued` or `running` returns success with an
 explicit pending status and no score or cache change; a terminal result uses the
 same feedback and error handling as blocking retrieval. Pending means the read
 succeeded, not that the candidate passed. Continue useful independent work
@@ -405,7 +425,7 @@ SUBMISSION_ID=$(curl -s -X POST http://localhost:8080/api/v1/submit \
 echo "Submission: $SUBMISSION_ID"
 
 # 3. Poll for result (repeat until status is "completed" or "error")
-curl -s http://localhost:8080/api/v1/result/$SUBMISSION_ID | jq .
+curl -s "http://localhost:8080/api/v1/result/$SUBMISSION_ID?token=$TOKEN" | jq .
 
 # 4. Check run history
 curl -s "http://localhost:8080/api/v1/history?token=$TOKEN" | jq .
@@ -415,10 +435,10 @@ curl -s "http://localhost:8080/api/v1/history?token=$TOKEN" | jq .
 
 ```bash
 while true; do
-  STATUS=$(curl -s http://localhost:8080/api/v1/result/$SUBMISSION_ID | jq -r '.status')
+  STATUS=$(curl -s "http://localhost:8080/api/v1/result/$SUBMISSION_ID?token=$TOKEN" | jq -r '.status')
   echo "Status: $STATUS"
   if [ "$STATUS" = "completed" ] || [ "$STATUS" = "error" ]; then
-    curl -s http://localhost:8080/api/v1/result/$SUBMISSION_ID | jq .
+    curl -s "http://localhost:8080/api/v1/result/$SUBMISSION_ID?token=$TOKEN" | jq .
     break
   fi
   sleep 5

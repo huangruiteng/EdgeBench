@@ -264,7 +264,10 @@ def test_native_runner_preserves_final_archive_and_judge_selection(
             return result
 
         def create_container(self, *args, **kwargs):
-            self.token = kwargs["environment"]["SFORGE_TOKEN"]
+            environment = kwargs["environment"]
+            assert "SFORGE_TOKEN" not in environment
+            relay_id = environment["SFORGE_FEEDBACK_URL"].rsplit("/", 1)[-1]
+            self.token = rt.state.resolve_feedback_relay(relay_id)[0]
             return super().create_container(*args, **kwargs)
 
         def copy_from_container(self, *_args, **_kwargs):

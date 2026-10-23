@@ -707,6 +707,7 @@ def run_agent(
                 if expected is not None and registered.get(key) != expected:
                     raise ValueError(f"Restored registration conflicts with requested {key}")
             session_token = registered["token"]
+            feedback_relay_id = registered["feedback_relay_id"]
             max_submissions = registered["max_agent_submissions"]
             submission_cooldown = registered["submission_cooldown"]
             logger.info("Reusing the exact live restored judge registration")
@@ -749,7 +750,9 @@ def run_agent(
                     wait = 2 * _reg_attempt
                     logger.warning("Register attempt %d/5 failed (%s), retrying in %ds...", _reg_attempt, exc, wait)
                     time.sleep(wait)
-            session_token = reg_resp.json()["token"]
+            registration = reg_resp.json()
+            session_token = registration["token"]
+            feedback_relay_id = registration["feedback_relay_id"]
             logger.info("Registered session with judge server")
 
         if restored_execution is not None:
@@ -763,8 +766,10 @@ def run_agent(
         env = _build_agent_env(agent, model)
         if backend.backend_name == "e2b":
             sanitize_e2b_proxy_env(env, internet=internet)
-        env["SFORGE_JUDGE_URL"] = judge_url
-        env["SFORGE_TOKEN"] = session_token
+        env["SFORGE_FEEDBACK_URL"] = (
+            judge_url.rstrip("/")
+            + f"/api/v1/feedback/{feedback_relay_id}"
+        )
         env["SFORGE_PATCH_DIR"] = task_spec.cwd
         env["SFORGE_SUBMIT_PATHS"] = " ".join(task_spec.submit_paths)
         env["SFORGE_SUBMIT_EXCLUDE_FLAGS"] = " ".join(

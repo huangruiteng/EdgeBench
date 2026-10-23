@@ -644,6 +644,7 @@ def install_routes(app, state: JudgeState) -> None:
             )
             return {
                 "token": token,
+                "feedback_relay_id": state.feedback_relay_id(token),
                 "run_id": request.run_id,
                 "checkpoint_id": request.checkpoint_id,
                 "manifest_sha256": request.manifest_sha256,
@@ -665,6 +666,7 @@ def install_routes(app, state: JudgeState) -> None:
             )
             return {
                 "token": token,
+                "feedback_relay_id": state.feedback_relay_id(token),
                 "run_id": request.run_id,
                 "checkpoint_id": request.checkpoint_id,
                 "manifest_sha256": request.manifest_sha256,

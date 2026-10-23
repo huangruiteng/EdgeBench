@@ -121,7 +121,9 @@ def submit(client, token, score):
     identifier = response.json()["submission_id"]
     until = time.monotonic() + 5
     while time.monotonic() < until:
-        result = client.get("/api/v1/result/" + identifier)
+        result = client.get(
+            "/api/v1/result/" + identifier, params={"token": token},
+        )
         if result.json()["status"] in ("completed", "error"):
             return response
         time.sleep(0.005)
@@ -306,7 +308,9 @@ def test_preserves_old_selected_archive_and_fresh_result_identity(service):
         e["submission_id"] for e in new["entries"]
     )
     for e in new["entries"]:
-        assert client.get("/api/v1/result/" + e["submission_id"]).json()["report"][
+        assert client.get(
+            "/api/v1/result/" + e["submission_id"], params={"token": new_token},
+        ).json()["report"][
             "score"
         ] in (10, 3)
     archive = (
@@ -386,7 +390,9 @@ def test_failed_grade_is_released_as_error_and_preserved(service, monkeypatch):
     entry = history(client, new)["entries"][0]
     assert entry["status"] == "error" and "score" not in entry
     assert (
-        client.get("/api/v1/result/" + entry["submission_id"]).json()["status"]
+        client.get(
+            "/api/v1/result/" + entry["submission_id"], params={"token": new},
+        ).json()["status"]
         == "error"
     )
     assert submit(client, new, 10).status_code == 429

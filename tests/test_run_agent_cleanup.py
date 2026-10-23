@@ -62,7 +62,9 @@ def harness(monkeypatch, tmp_path):
     history = {"best_score": 0.7, "best_pass_rate": 0.5, "best_round": "round-1",
                "agent_submissions": 1, "auto_submissions": 2, "entries": []}
     registration = Mock()
-    registration.json.return_value = {"token": "synthetic-session"}
+    registration.json.return_value = {
+        "token": "synthetic-session", "feedback_relay_id": "synthetic-relay",
+    }
     history_response = Mock()
     history_response.json.return_value = history
     monkeypatch.setattr(runner.requests, "post", Mock(return_value=registration))

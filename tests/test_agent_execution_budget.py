@@ -71,7 +71,8 @@ def harness(tmp_path, monkeypatch):
     backend.exec_run_with_timeout.side_effect = execute
     response = Mock()
     response.json.return_value = {
-        "token": "synthetic-session", "entries": [], "best_score": None,
+        "token": "synthetic-session", "feedback_relay_id": "synthetic-relay",
+        "entries": [], "best_score": None,
         "best_pass_rate": 0.0, "agent_submissions": 0, "auto_submissions": 0,
     }
     monkeypatch.setattr(runner.requests, "post", Mock(return_value=response))
@@ -103,6 +104,10 @@ def test_dispatch_prompt_uses_effective_budget(harness, game_mode, explicit, con
     result = harness.run(timeout=explicit)
     assert len(harness.captured) == 1  # A valid short run is not forced to continue.
     dispatch = harness.captured[0]
+    assert "SFORGE_TOKEN" not in dispatch["environment"]
+    assert dispatch["environment"]["SFORGE_FEEDBACK_URL"].endswith(
+        "/api/v1/feedback/synthetic-relay"
+    )
     assert dispatch["timeout"] == expected
     assert f"{expected} seconds" in dispatch["prompt"]
     assert "conflicting whole-run Agent time limits" in dispatch["prompt"]
