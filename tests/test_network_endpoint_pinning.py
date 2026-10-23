@@ -57,7 +57,11 @@ def test_startup_reuses_host_pin_when_dns_changes(tmp_path, monkeypatch, backend
     monkeypatch.setattr(runner, "get_admin_secret", lambda path: "fixture-secret")
     monkeypatch.setattr(runner, "_extract_archive_from_container", lambda *args: b"fixture")
     monkeypatch.setattr(runner.requests, "post", lambda *args, **kwargs: SimpleNamespace(
-        raise_for_status=lambda: None, json=lambda: {"token": "fixture-token"},
+        raise_for_status=lambda: None,
+        json=lambda: {
+            "token": "fixture-token",
+            "feedback_relay_id": "fixture-relay",
+        },
     ))
     monkeypatch.setattr(runner.requests, "get", lambda *args, **kwargs: SimpleNamespace(
         raise_for_status=lambda: None, json=lambda: {"entries": []},
