@@ -19,7 +19,7 @@ private data, reference solutions or solver trajectories into this repository.
 
 ```sh
 docker build --network=none \
-  -t seededge/edgebench.judge.order_addition_permutation_optimization:checksum-v1 \
+  -t edgebench.judge.order_addition_permutation_optimization:checksum-v1 \
   examples/order-addition-grader-repair
 ```
 
@@ -32,7 +32,9 @@ formula at its reference, saturation and penalty boundaries. No generated
 `final_result.txt` is left in the resulting image.
 
 For new evaluations, copy the task manifest and change only
-`judge.image_tag` to `checksum-v1`, retaining the default `seededge` registry.
+`judge.image_tag` to `checksum-v1`. The local image must have the unprefixed
+`edgebench.judge.<task_id>:<image_tag>` name above: SForge's local evaluation
+resolves that name even when `seededge` is configured as the pull registry.
 Record the resulting image ID/digest and repair source commit with the copied
 manifest. The source dataset, existing image tag and running experiments are
 not modified by this recipe. Image publication and dataset pin updates are
