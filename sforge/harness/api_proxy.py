@@ -35,8 +35,9 @@ import logging
 import signal
 import socket
 import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import requests as req_lib
 
@@ -68,6 +69,14 @@ def _make_handler(
         protocol_version = "HTTP/1.0"
 
         def do_request(self):
+            started_at = time.monotonic()
+            request_path = urlsplit(self.path).path
+            body_size = 0
+            status = None
+            content_type = None
+            first_byte_at = None
+            chunk_count = 0
+            terminal_reason = "upstream_error"
             allowed_ips = policy["allowed_ips"]
             if allowed_ips is not None and self.client_address[0] not in allowed_ips:
                 self.send_error(403, "Client is not allowed")
@@ -78,6 +87,7 @@ def _make_handler(
             content_length = self.headers.get("Content-Length")
             if content_length:
                 body = self.rfile.read(int(content_length))
+                body_size = len(body)
 
             fwd_headers = {}
             for key, val in self.headers.items():
@@ -103,6 +113,8 @@ def _make_handler(
                     timeout=300,
                     stream=True,
                 ) as resp:
+                    status = resp.status_code
+                    content_type = resp.headers.get("Content-Type")
                     self.send_response(resp.status_code)
                     for key, val in resp.headers.items():
                         if key.lower() in (
@@ -124,13 +136,18 @@ def _make_handler(
                     while chunk := resp.raw.read1(
                         _STREAM_READ_SIZE, decode_content=True
                     ):
+                        if first_byte_at is None:
+                            first_byte_at = time.monotonic()
+                        chunk_count += 1
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                    terminal_reason = "upstream_eof"
             except (BrokenPipeError, ConnectionResetError):
                 # A solver timeout or cancellation can close a streaming model
                 # response normally. The response socket is already unusable;
                 # attempting to write a secondary 502 only creates another
                 # exception and a noisy server traceback.
+                terminal_reason = "client_disconnect"
                 logger.debug("api-proxy client disconnected during response")
             except Exception as exc:
                 # Request exceptions can embed headers or request objects.  Do
@@ -140,7 +157,27 @@ def _make_handler(
                     try:
                         self.send_error(502, "Upstream request failed")
                     except (BrokenPipeError, ConnectionResetError):
+                        terminal_reason = "client_disconnect"
                         logger.debug("api-proxy client disconnected before error response")
+            finally:
+                ttfb_ms = (
+                    round((first_byte_at - started_at) * 1000)
+                    if first_byte_at is not None
+                    else None
+                )
+                logger.info(
+                    "api-proxy request method=%s path=%s body_size=%d "
+                    "status=%s content_type=%s ttfb_ms=%s chunk_count=%d "
+                    "terminal_reason=%s",
+                    self.command,
+                    request_path,
+                    body_size,
+                    status,
+                    content_type,
+                    ttfb_ms,
+                    chunk_count,
+                    terminal_reason,
+                )
 
         do_GET = do_request
         do_POST = do_request
