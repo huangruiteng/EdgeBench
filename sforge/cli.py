@@ -910,6 +910,41 @@ def cmd_verify_attestation(args):
     }, indent=2, ensure_ascii=False))
 
 
+def cmd_qualify_attestation(args):
+    """Qualify one terminal run from signed runtime evidence only."""
+    from sforge.harness.runtime_qualification import qualify_runtime_attestation
+
+    key_value = args.key_file or os.environ.get("SFORGE_RUNTIME_ATTESTATION_KEY_FILE")
+    if not key_value:
+        print(
+            "Error: --key-file or SFORGE_RUNTIME_ATTESTATION_KEY_FILE is required",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        policy = json.loads(Path(args.policy).read_text(encoding="utf-8"))
+        if not isinstance(policy, dict):
+            raise TypeError("policy_not_object")
+        receipt = qualify_runtime_attestation(
+            Path(args.journal),
+            Path(key_value),
+            evidence_root=Path(args.evidence_root),
+            policy=policy,
+            expected_run_id=args.expected_run_id,
+            expected_task_id=args.expected_task_id,
+            expected_source_revision=args.expected_source_revision,
+        )
+    except (OSError, TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+        print(json.dumps({
+            "ok": False,
+            "schema_version": "sforge_runtime_qualification_v1",
+            "error": "runtime_qualification_input_invalid",
+        }))
+        sys.exit(2)
+    print(json.dumps(receipt, indent=2, ensure_ascii=False))
+    if args.require_qualified and not receipt["runtime_qualified"]:
+        sys.exit(1)
+
 
 def cmd_fetch_tasks(args):
     """Download benchmark task definitions from HuggingFace Hub."""
@@ -1116,6 +1151,24 @@ def main():
     p_attestation.add_argument("--expected-task-id", default=None)
     p_attestation.add_argument("--expected-source-revision", default=None)
     p_attestation.set_defaults(func=cmd_verify_attestation)
+
+    # qualify-attestation
+    p_qualification = subparsers.add_parser(
+        "qualify-attestation",
+        help="Qualify a terminal run from its signed runtime evidence",
+    )
+    p_qualification.add_argument("--journal", required=True)
+    p_qualification.add_argument("--evidence-root", required=True)
+    p_qualification.add_argument("--policy", required=True)
+    p_qualification.add_argument(
+        "--key-file", default=None,
+        help="Host signing key (defaults to SFORGE_RUNTIME_ATTESTATION_KEY_FILE)",
+    )
+    p_qualification.add_argument("--expected-run-id", required=True)
+    p_qualification.add_argument("--expected-task-id", required=True)
+    p_qualification.add_argument("--expected-source-revision", required=True)
+    p_qualification.add_argument("--require-qualified", action="store_true")
+    p_qualification.set_defaults(func=cmd_qualify_attestation)
 
     # list
     p_list = subparsers.add_parser("list", help="List available tasks")

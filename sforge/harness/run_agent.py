@@ -687,7 +687,7 @@ def _record_terminal_attestation(
     evidence = {
         name: log_dir / name for name in (
             "solver_execution.json", "grading_status.json", "run_history.json",
-            "game_history.json", "final_archive.tar.gz",
+            "game_history.json", "worker-profile.json", "final_archive.tar.gz",
         )
     }
     recorder.record(
