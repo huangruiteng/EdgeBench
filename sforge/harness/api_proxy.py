@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 import requests as req_lib
 
 logger = logging.getLogger(__name__)
+_STREAM_READ_SIZE = 64 * 1024
 
 
 def _find_free_port(host: str = "0.0.0.0") -> int:
@@ -94,30 +95,37 @@ def _make_handler(
 
             response_started = False
             try:
-                resp = session.request(
+                with session.request(
                     method=self.command,
                     url=upstream_url,
                     headers=fwd_headers,
                     data=body,
                     timeout=300,
                     stream=True,
-                )
-                self.send_response(resp.status_code)
-                for key, val in resp.headers.items():
-                    if key.lower() in (
-                        "transfer-encoding",
-                        "content-encoding",
-                        "content-length",
-                        "connection",
-                        "keep-alive",
+                ) as resp:
+                    self.send_response(resp.status_code)
+                    for key, val in resp.headers.items():
+                        if key.lower() in (
+                            "transfer-encoding",
+                            "content-encoding",
+                            "content-length",
+                            "connection",
+                            "keep-alive",
+                        ):
+                            continue
+                        self.send_header(key, val)
+                    self.end_headers()
+                    response_started = True
+                    # ``iter_content(chunk_size=None)`` asks urllib3 to read
+                    # until EOF.  Provider SSE responses can remain open for
+                    # minutes, so that mode withholds every event from the
+                    # agent.  ``read1`` returns currently available decoded
+                    # bytes without waiting to fill the requested buffer.
+                    while chunk := resp.raw.read1(
+                        _STREAM_READ_SIZE, decode_content=True
                     ):
-                        continue
-                    self.send_header(key, val)
-                self.end_headers()
-                response_started = True
-                for chunk in resp.iter_content(chunk_size=None):
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 # A solver timeout or cancellation can close a streaming model
                 # response normally. The response socket is already unusable;
