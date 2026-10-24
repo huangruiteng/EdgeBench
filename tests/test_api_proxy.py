@@ -23,14 +23,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-from sforge.harness.api_proxy import APIProxy
 from sforge.harness.agent.codex import CodexAgent
+from sforge.harness.api_proxy import APIProxy
 from sforge.harness.config import SForgeConfig
 
-
 runner = importlib.import_module("sforge.harness.run_agent")
-_HOST_TOKEN = "-".join(("synthetic", "host", "token"))
-_CONTAINER_TOKEN = "-".join(("synthetic", "container", "token"))
+_HOST_TOKEN = "-".join(("synthetic", "host", "token"))  # noqa: FLY002
+_CONTAINER_TOKEN = "-".join(("synthetic", "container", "token"))  # noqa: FLY002
 
 
 def _direct_session() -> requests.Session:
@@ -148,21 +147,23 @@ def test_proxy_streams_codex_response_events_before_response_completion(caplog):
 
     def consume_first_event():
         try:
-            with _direct_session() as client:
-                with client.post(
+            with (
+                _direct_session() as client,
+                client.post(
                     proxy.local_url + "/responses?source=codex",
                     data=b'{"model": "synthetic-model", "input": "private-prompt", "stream": true}',
                     stream=True,
                     timeout=5,
-                ) as response:
-                    response.raise_for_status()
-                    received = b""
-                    for chunk in response.iter_content(chunk_size=1):
-                        received += chunk
-                        if b"\n\n" in received:
-                            first_downstream_event.set()
-                            break
-        except Exception as exc:
+                ) as response,
+            ):
+                response.raise_for_status()
+                received = b""
+                for chunk in response.iter_content(chunk_size=1):
+                    received += chunk
+                    if b"\n\n" in received:
+                        first_downstream_event.set()
+                        break
+        except requests.RequestException as exc:
             consumer_errors.append(exc)
         finally:
             consumer_finished.set()

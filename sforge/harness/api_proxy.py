@@ -36,7 +36,7 @@ import signal
 import socket
 import threading
 import time
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, urlsplit
 
 import requests as req_lib
@@ -149,7 +149,7 @@ def _make_handler(
                 # exception and a noisy server traceback.
                 terminal_reason = "client_disconnect"
                 logger.debug("api-proxy client disconnected during response")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 # Request exceptions can embed headers or request objects.  Do
                 # not reflect their text to the untrusted container or logs.
                 logger.warning("api-proxy upstream request failed: %s", type(exc).__name__)
