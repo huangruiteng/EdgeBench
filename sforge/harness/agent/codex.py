@@ -51,6 +51,10 @@ fi''',
     default_api_base_url = "https://api.openai.com"
     model_env = "CODEX_MODEL"
     stop_hook = "codex"
+    credential_env_names = ("OPENAI_API_KEY", "CODEX_API_KEY")
+
+    def credential_proxy_headers(self, api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
 
     def augment_env(self, env: dict[str, str], model: str | None) -> None:
         if not self._config.agent_api_base_url:

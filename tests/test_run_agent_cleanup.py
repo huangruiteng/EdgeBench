@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import os
 import signal
 from types import SimpleNamespace
 from typing import ClassVar
@@ -28,6 +30,7 @@ from sforge.harness.agent.base import Agent
 from sforge.harness.backend.base import ContainerBackend, StreamingExecResult
 from sforge.harness.config import SForgeConfig
 from sforge.harness.task_spec import JudgeSpec, TaskSpec, WorkSpec
+from sforge.harness.runtime_attestation import verify_runtime_attestation
 
 runner = importlib.import_module("sforge.harness.run_agent")
 
@@ -37,6 +40,11 @@ class SyntheticAgent(Agent):
     install_cmds: ClassVar[list[str]] = ["install-synthetic-agent"]
     run_cmd = "run-synthetic-agent {prompt_file}"
     api_key_env = "SYNTHETIC_API_KEY"
+    api_base_env = "SYNTHETIC_API_BASE"
+    credential_env_names = ("SYNTHETIC_API_KEY", "SYNTHETIC_API_KEY_ALIAS")
+
+    def credential_proxy_headers(self, api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
 
 
 @pytest.fixture
@@ -88,6 +96,7 @@ def harness(monkeypatch, tmp_path):
         )
 
     yield SimpleNamespace(backend=backend, handle=handle, run=run, close=closed,
+                          config=config,
                           archive=archive, history=history, previous_sigint=previous_sigint)
     signal.signal(signal.SIGINT, previous_sigint)
 
@@ -97,6 +106,117 @@ def assert_cleaned(harness, handle):
     assert harness.backend.cleanup_container.call_args.args[0] is handle
     harness.close.assert_called_once()
     assert signal.getsignal(signal.SIGINT) == harness.previous_sigint
+
+
+def test_docker_provider_credential_stays_in_host_gateway(harness, monkeypatch, tmp_path):
+    provider_secret = "synthetic-provider-secret"
+    proxies = []
+
+    class FakeProxy:
+        def __init__(self, **kwargs):
+            self.port = 43123
+            self.kwargs = kwargs
+            self.started = False
+            self.stopped = False
+            self.allowed_ips = None
+            proxies.append(self)
+
+        def restrict_clients(self, allowed_ips):
+            self.allowed_ips = set(allowed_ips)
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr("sforge.harness.api_proxy.APIProxy", FakeProxy)
+    harness.config.agent_api_key = provider_secret
+    harness.config.agent_api_base_url = "https://provider.example/v1"
+    harness.config.agent_extra_env.update({
+        "SYNTHETIC_API_KEY": provider_secret,
+        "SYNTHETIC_API_KEY_ALIAS": provider_secret,
+    })
+    harness.backend.get_container_ip.return_value = "192.0.2.7"
+
+    result = harness.run()
+
+    assert result.agent_output == "solver-output"
+    assert len(proxies) == 1
+    proxy = proxies[0]
+    assert proxy.started and proxy.stopped
+    assert proxy.allowed_ips == {"192.0.2.7"}
+    assert proxy.kwargs["target_url"] == "https://provider.example/v1"
+    assert proxy.kwargs["injected_headers"] == {
+        "Authorization": f"Bearer {provider_secret}",
+    }
+
+    container_env = harness.backend.create_container.call_args.kwargs["environment"]
+    assert container_env["SYNTHETIC_API_KEY"] == "sforge-host-credential"
+    assert "SYNTHETIC_API_KEY_ALIAS" not in container_env
+    assert container_env["NO_PROXY"].split(",") == ["host.docker.internal"]
+    assert container_env["no_proxy"].split(",") == ["host.docker.internal"]
+    assert provider_secret not in repr(harness.backend.mock_calls)
+    for artifact in tmp_path.rglob("*"):
+        if artifact.is_file():
+            assert provider_secret not in artifact.read_text(errors="replace")
+
+
+def test_runner_attests_observed_boundaries_and_terminal_evaluation(harness, tmp_path):
+    key = tmp_path / "runtime-attestation.key"
+    key.write_bytes(b"test-only-runtime-attestation-key-32-bytes")
+    os.chmod(key, 0o600)
+    harness.config.runtime_attestation_key_file = key
+    harness.config.runner_source_revision = "test-source-revision"
+    harness.handle.id = "container-id"
+    harness.handle.name = "container-name"
+
+    result = harness.run(submission_cooldown=1800)
+
+    log_dir = tmp_path / "runs" / "synthetic-run" / "cleanup-fixture"
+    records = verify_runtime_attestation(
+        log_dir / "runtime-attestation.jsonl", key,
+        expected_run_id="synthetic-run", expected_task_id="cleanup-fixture",
+        expected_source_revision="test-source-revision",
+    )
+    assert [record["payload"]["phase"] for record in records] == [
+        "admission", "solver_ready", "terminal",
+    ]
+    protocol = records[0]["payload"]["protocol"]
+    assert protocol["active_evaluation"]["cooldown_seconds"] == 1800
+    assert protocol["background_evaluation"] == {
+        "enabled": False, "interval_seconds": 300,
+    }
+    boundaries = records[1]["payload"]["facts"]
+    assert boundaries["container"]["backend"] == "docker"
+    assert boundaries["container"]["name"] == "container-name"
+    assert boundaries["container"]["id_sha256"] == hashlib.sha256(
+        b"container-id"
+    ).hexdigest()
+    assert boundaries["container"]["work_image"].endswith("cleanup-fixture:fixture")
+    assert boundaries["container"]["judge_image"].endswith("cleanup-fixture:fixture")
+    assert boundaries["network_boundary"] == {
+        "restricted_requested": False, "restricted_applied": False,
+    }
+    assert boundaries["credential_boundary"]["mode"] == "none"
+    terminal = records[-1]["payload"]["facts"]
+    assert terminal["evaluation"]["status"] == "complete"
+    assert terminal["outcome"]["best_score"] == result.best_score
+
+
+def test_attestation_configuration_fails_before_runtime_side_effects(harness, tmp_path):
+    key = tmp_path / "runtime-attestation.key"
+    key.write_bytes(b"test-only-runtime-attestation-key-32-bytes")
+    os.chmod(key, 0o644)
+    harness.config.runtime_attestation_key_file = key
+    harness.config.runner_source_revision = "test-source-revision"
+
+    with pytest.raises(PermissionError, match="group or others"):
+        harness.run()
+
+    harness.backend.image_exists.assert_not_called()
+    harness.backend.create_container.assert_not_called()
+    harness.close.assert_called_once()
 
 
 @pytest.mark.parametrize("backend_name", ["docker", "k8s", "e2b"])

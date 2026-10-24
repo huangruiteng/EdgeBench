@@ -52,7 +52,10 @@ agents so existing results stay comparable. Claude 5-family models
 
 ### API Key
 
-Set via the `SFORGE_AGENT_API_KEY` environment variable. The harness maps this to the agent-specific env var (e.g., `ANTHROPIC_AUTH_TOKEN` for Claude Code, `CODEX_API_KEY` for Codex):
+Set via the `SFORGE_AGENT_API_KEY` environment variable. Docker Codex runs keep
+the real value in a run-scoped host gateway and expose only a placeholder in the
+Work container. Other supported combinations map it to the agent-specific
+environment variable (for example, `ANTHROPIC_AUTH_TOKEN` for Claude Code):
 
 ```bash
 SFORGE_AGENT_API_KEY="sk-xxxx" sforge run --task ad_placement_optimization --agent claude-code
