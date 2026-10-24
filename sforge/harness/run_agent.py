@@ -60,6 +60,7 @@ from sforge.harness.evolve_scripts import (
     generate_submit_script,
 )
 from sforge.harness.restored_registration import RestoredExecution, RestoredRegistration
+from sforge.harness.runtime_attestation import RuntimeAttestationRecorder
 from sforge.harness.task_spec import TaskSpec
 
 
@@ -635,6 +636,84 @@ def _solver_segment_result(result, stop_requested: bool) -> dict:
     }
 
 
+def _runtime_protocol(
+    *, agent: Agent, backend: ContainerBackend, model: str | None,
+    effective_timeout: int, eval_interval: int, disable_stop_hook: bool,
+    disable_auto_eval: bool, disable_auto_resume: bool, internet: bool,
+    max_submissions: int | None, submission_cooldown: int | None,
+) -> dict:
+    """Return the bounded control protocol that the runner will enforce."""
+    return {
+        "agent": agent.name,
+        "model": model or agent._config.agent_model or agent.default_model,
+        "backend": backend.backend_name,
+        "solver_timeout_seconds": effective_timeout,
+        "stop_hook_enabled": not disable_stop_hook and agent.stop_hook is not None,
+        "auto_resume_enabled": not disable_auto_resume and agent.resume_cmd is not None,
+        "internet_enabled": internet,
+        "background_evaluation": {
+            "enabled": not disable_auto_eval and eval_interval > 0,
+            "interval_seconds": eval_interval,
+        },
+        "active_evaluation": {
+            "max_submissions": max_submissions,
+            "cooldown_seconds": submission_cooldown,
+        },
+    }
+
+
+def _record_terminal_attestation(
+    recorder: RuntimeAttestationRecorder | None,
+    log_dir: Path,
+    result: RunResult,
+) -> None:
+    if recorder is None:
+        return
+    grading_path = log_dir / "grading_status.json"
+    evaluation: dict = {}
+    if grading_path.is_file():
+        try:
+            value = json.loads(grading_path.read_text())
+            if isinstance(value, dict):
+                evaluation = {
+                    key: value.get(key) for key in (
+                        "status", "reason", "pending_submissions",
+                        "elapsed_seconds", "wait_budget_seconds",
+                        "history_observed", "history_sha256",
+                    )
+                }
+        except (OSError, ValueError):
+            evaluation = {"status": "unreadable"}
+    evidence = {
+        name: log_dir / name for name in (
+            "solver_execution.json", "grading_status.json", "run_history.json",
+            "game_history.json", "final_archive.tar.gz",
+        )
+    }
+    recorder.record(
+        "terminal",
+        "complete" if result.grading_status == "complete" else "incomplete",
+        {
+            "solver": {
+                "timed_out": result.timed_out,
+                "runtime_seconds": result.runtime_seconds,
+                "resume_count": result.resume_count,
+                "execution_status": (result.solver_execution or {}).get("status"),
+            },
+            "evaluation": evaluation,
+            "outcome": {
+                "grading_status": result.grading_status,
+                "grading_reason": result.grading_reason,
+                "agent_submissions": result.agent_submissions,
+                "background_submissions": result.auto_submissions,
+                "best_score": result.best_score,
+                "best_pass_rate": result.best_pass_rate,
+            },
+        },
+        evidence_files=evidence,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -753,9 +832,41 @@ def run_agent(
     admin_secret = ""
     session_token = None
     solver_execution = {"schema_version": 1, "status": "not_started", "segments": []}
+    runtime_attestation = None
+
+    if config.runtime_attestation_key_file is not None:
+        try:
+            runtime_attestation = RuntimeAttestationRecorder(
+                log_dir,
+                key_file=config.runtime_attestation_key_file,
+                runner_source_revision=config.runner_source_revision or "",
+                run_id=run_id,
+                task_id=task_spec.task_id,
+                resume=restored_execution is not None,
+                protocol=_runtime_protocol(
+                    agent=agent, backend=backend, model=model,
+                    effective_timeout=effective_timeout, eval_interval=eval_interval,
+                    disable_stop_hook=disable_stop_hook,
+                    disable_auto_eval=disable_auto_eval,
+                    disable_auto_resume=disable_auto_resume, internet=internet,
+                    max_submissions=max_submissions,
+                    submission_cooldown=submission_cooldown,
+                ),
+            )
+        except BaseException:
+            if restored_execution is not None:
+                restored_execution.close()
+            close_logger(logger)
+            raise
 
     try:
         _write_solver_execution(log_dir, solver_execution)
+        if runtime_attestation is not None:
+            runtime_attestation.record(
+                "admission", "accepted",
+                {"restored_execution": restored_execution is not None},
+                evidence_files={"solver_execution": log_dir / "solver_execution.json"},
+            )
         admin_secret = get_admin_secret(config.log_dir)
         # 0. Clean up stale iptables chains from previous runs that were killed
         if backend.backend_name == "docker":
@@ -1059,6 +1170,35 @@ def run_agent(
             net_isolation = backend.create_network_isolation(handle, endpoints, logger)
             net_isolation.apply()
 
+        if runtime_attestation is not None:
+            credential_mode = (
+                "host_gateway" if credential_proxy is not None
+                else "container_environment" if config.agent_api_key else "none"
+            )
+            runtime_attestation.record(
+                "solver_ready", "ready",
+                {
+                    "container": {
+                        "backend": backend.backend_name,
+                        "name": handle.name,
+                        "id_sha256": hashlib.sha256(handle.id.encode()).hexdigest(),
+                        "work_image": task_spec.work_image_key,
+                        "judge_image": task_spec.judge_image_key,
+                    },
+                    "network_boundary": {
+                        "restricted_requested": not internet,
+                        "restricted_applied": net_isolation is not None,
+                    },
+                    "credential_boundary": {
+                        "provider_credential_configured": bool(config.agent_api_key),
+                        "mode": credential_mode,
+                        "real_credential_absent_from_container": credential_proxy is not None,
+                        "gateway_client_ip_restricted": credential_proxy is not None,
+                    },
+                },
+                evidence_files={"prompt": log_dir / "agent_prompt.md"},
+            )
+
         # 5. Write prompt
         if task_spec.game_mode:
             prompt = generate_game_prompt(
@@ -1348,6 +1488,7 @@ def run_agent(
                 f"agent_subs={agent_subs}, auto_subs={auto_subs}, "
                 f"resumes={resume_count}, runtime={runtime:.1f}s"
             )
+        _record_terminal_attestation(runtime_attestation, log_dir, result)
         return result
 
     except KeyboardInterrupt:
@@ -1397,7 +1538,7 @@ def run_agent(
             f"agent_subs={agent_subs}, auto_subs={auto_subs}"
         )
 
-        return RunResult(
+        result = RunResult(
             archive=interrupted_archive,
             best_pass_rate=best_pass_rate,
             best_score=best_score,
@@ -1412,6 +1553,8 @@ def run_agent(
             grading_reason=grading.reason,
             solver_execution=solver_execution,
         )
+        _record_terminal_attestation(runtime_attestation, log_dir, result)
+        return result
     except Exception as e:
         logger.error(f"Error: {e}\n{traceback.format_exc()}")
         grading = _GradingResult(None, "unknown", "harness_error")
@@ -1441,7 +1584,7 @@ def run_agent(
         agent_subs = history.get("agent_submissions", 0)
         auto_subs = history.get("auto_submissions", 0)
 
-        return RunResult(
+        result = RunResult(
             best_pass_rate=best_pass_rate,
             best_score=best_score,
             best_round=best_round,
@@ -1455,6 +1598,8 @@ def run_agent(
             grading_reason=grading.reason,
             solver_execution=solver_execution,
         )
+        _record_terminal_attestation(runtime_attestation, log_dir, result)
+        return result
     finally:
         if auto_eval_stop is not None:
             auto_eval_stop.set()

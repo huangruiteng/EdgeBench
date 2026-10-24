@@ -50,6 +50,10 @@ class SForgeConfig:
     agent_effort: str | None = None
     agent_timeout: int | None = None
     agent_extra_env: dict[str, str] = field(default_factory=dict)
+    # Optional host-only signing material for append-only runtime evidence.
+    # The key file is never included in a container environment or run config.
+    runtime_attestation_key_file: Path | None = None
+    runner_source_revision: str | None = None
     # Total judge slots shared by every launcher process on this host. Process-local
     # pools multiply otherwise, so the cross-process bound is the one that matters.
     judge_host_capacity: int | None = None
@@ -126,6 +130,8 @@ def load_config(cli_overrides: dict | None = None) -> SForgeConfig:
         "agent_model": ["SFORGE_AGENT_MODEL"],
         "agent_effort": ["SFORGE_AGENT_EFFORT"],
         "agent_timeout": ["SFORGE_AGENT_TIMEOUT"],
+        "runtime_attestation_key_file": ["SFORGE_RUNTIME_ATTESTATION_KEY_FILE"],
+        "runner_source_revision": ["SFORGE_RUNNER_SOURCE_REVISION"],
         "git_user": ["SFORGE_GIT_USER"],
         "git_token": ["SFORGE_GIT_TOKEN"],
         "registry": ["SFORGE_REGISTRY"],

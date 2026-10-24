@@ -880,6 +880,34 @@ def cmd_list(args):
         print(f"{_pad(t.task_id, col_id)} {_pad(t.name, col_name)} {_pad(t.base_image, col_base)} {_pad(t.judge.parser, col_parser)}")
 
 
+def cmd_verify_attestation(args):
+    """Verify a host-signed runtime evidence journal."""
+    from sforge.harness.runtime_attestation import verify_runtime_attestation
+
+    key_value = args.key_file or os.environ.get("SFORGE_RUNTIME_ATTESTATION_KEY_FILE")
+    if not key_value:
+        print(
+            "Error: --key-file or SFORGE_RUNTIME_ATTESTATION_KEY_FILE is required",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    records = verify_runtime_attestation(
+        Path(args.journal), Path(key_value),
+        expected_run_id=args.expected_run_id,
+        expected_task_id=args.expected_task_id,
+        expected_source_revision=args.expected_source_revision,
+    )
+    identity = records[0]["payload"]["identity"]
+    print(json.dumps({
+        "verified": True,
+        "records": len(records),
+        "phases": [item["payload"]["phase"] for item in records],
+        "identity": identity,
+        "terminal_status": records[-1]["payload"]["status"],
+        "key_id": records[-1]["signature"]["key_id"],
+    }, indent=2, ensure_ascii=False))
+
+
 
 def cmd_fetch_tasks(args):
     """Download benchmark task definitions from HuggingFace Hub."""
@@ -1072,6 +1100,20 @@ def main():
     p_viz.add_argument("--host", default="127.0.0.1")
     p_viz.add_argument("--port", type=int, default=8000)
     p_viz.set_defaults(func=cmd_visualizer)
+
+    # verify-attestation
+    p_attestation = subparsers.add_parser(
+        "verify-attestation", help="Verify a signed runtime evidence journal",
+    )
+    p_attestation.add_argument("--journal", required=True)
+    p_attestation.add_argument(
+        "--key-file", default=None,
+        help="Host signing key (defaults to SFORGE_RUNTIME_ATTESTATION_KEY_FILE)",
+    )
+    p_attestation.add_argument("--expected-run-id", default=None)
+    p_attestation.add_argument("--expected-task-id", default=None)
+    p_attestation.add_argument("--expected-source-revision", default=None)
+    p_attestation.set_defaults(func=cmd_verify_attestation)
 
     # list
     p_list = subparsers.add_parser("list", help="List available tasks")

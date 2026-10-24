@@ -49,6 +49,8 @@ SForge 大部分配置可通过 `SFORGE_*` 环境变量注入；仅 CLI/YAML 支
 | `SFORGE_AGENT_EFFORT` | Agent 推理强度（`low`、`medium`、`high` 或 `max`） |
 | `SFORGE_AGENT_TIMEOUT` | Agent 超时时间（秒） |
 | `SFORGE_AGENT_EXTRA_ENV` | Agent 容器额外环境变量，格式：`"KEY1=VAL1,KEY2=VAL2"` |
+| `SFORGE_RUNTIME_ATTESTATION_KEY_FILE` | 可选的宿主侧运行证明 HMAC 密钥文件；至少 32 字节，且不得向 group／other 开放任何权限。 |
+| `SFORGE_RUNNER_SOURCE_REVISION` | 写入签名运行证明的精确源码版本；开启运行证明时必填。 |
 | `SFORGE_HTTP_PROXY` | 运行阶段注入 Agent 容器的 HTTP 代理。不推荐常规使用；不兼容 `--disable-internet`。 |
 | `SFORGE_HTTPS_PROXY` | 运行阶段注入 Agent 容器的 HTTPS 代理。不推荐常规使用；不兼容 `--disable-internet`。 |
 | `SFORGE_NO_PROXY` | 运行阶段不走代理的地址 |
@@ -73,6 +75,25 @@ API Base URL，并且只接受该 Work 容器 IP 的请求。网关用真实模�
 
 这一能力目前不代表其他 Agent 或远程后端已经具备同等的凭据隔离；它们的模型服务认证
 协议和网络边界需要分别验证。
+:::
+
+::: info 带签名的运行证明
+同时设置上述两个运行证明变量后，宿主 runner 会在每个题目的运行目录写入只追加的
+`runtime-attestation.jsonl`。其中的签名哈希链覆盖准入、实际容器／网络／凭据边界、
+主动与后台评测协议，以及终态评分耗时。密钥和密钥路径不会进入 Work／Judge 容器，
+也不会写入运行配置。
+
+密钥应放在日志目录之外，并只交给可信分析环境。密钥缺失、权限过宽、源码版本缺失、
+记录被修改或恢复时协议不一致都会失败关闭；没有当场生成记录的历史运行不能事后补签。
+
+可信分析端可以同时核对签名和预期身份：
+
+```bash
+sforge verify-attestation \
+  --journal logs/runs/<run>/<task>/runtime-attestation.jsonl \
+  --expected-run-id <run> --expected-task-id <task> \
+  --expected-source-revision <commit>
+```
 :::
 
 ## Judge 变量

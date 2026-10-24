@@ -49,6 +49,8 @@ Used when running agents via `sforge run`. These are injected as container envir
 | `SFORGE_AGENT_EFFORT` | Reasoning effort (`low`, `medium`, `high`, or `max`) |
 | `SFORGE_AGENT_TIMEOUT` | Agent timeout in seconds |
 | `SFORGE_AGENT_EXTRA_ENV` | Extra env vars for agent container, format: `"KEY1=VAL1,KEY2=VAL2"` |
+| `SFORGE_RUNTIME_ATTESTATION_KEY_FILE` | Optional host-only HMAC key file for signed runtime evidence. The file must contain at least 32 bytes and have no group/other permissions. |
+| `SFORGE_RUNNER_SOURCE_REVISION` | Exact source revision bound into signed runtime evidence; required when runtime attestation is enabled. |
 | `SFORGE_HTTP_PROXY` | HTTP proxy injected into the agent container at run time. Not recommended for normal use; incompatible with `--disable-internet`. |
 | `SFORGE_HTTPS_PROXY` | HTTPS proxy injected into the agent container at run time. Not recommended for normal use; incompatible with `--disable-internet`. |
 | `SFORGE_NO_PROXY` | Addresses that bypass the run-time proxy |
@@ -77,6 +79,29 @@ placed in the Work container environment, command line, or Codex session files.
 This protection does not yet claim equivalent credential isolation for other
 agents or remote backends. Their provider authentication protocols and network
 boundaries must be qualified separately.
+:::
+
+::: info Signed runtime evidence
+When both runtime-attestation variables are set, the host runner writes an
+append-only `runtime-attestation.jsonl` in each task run directory. Signed,
+hash-chained records capture admission, the observed container/network/credential
+boundaries, the active and background evaluation protocol, and terminal grading
+timing. The signing key and its path are never sent to a Work or Judge container
+or copied into run configuration.
+
+Keep the key outside the log tree and retain it in the trusted analysis
+environment. A missing key, an insecure key file, an absent source revision, a
+changed record, or a mismatched restored protocol fails closed. Historical runs
+without these records cannot be attested after the fact.
+
+Verify a journal with the trusted host key and expected identity:
+
+```bash
+sforge verify-attestation \
+  --journal logs/runs/<run>/<task>/runtime-attestation.jsonl \
+  --expected-run-id <run> --expected-task-id <task> \
+  --expected-source-revision <commit>
+```
 :::
 
 ## Judge Variables
