@@ -216,15 +216,16 @@ def judge_submission(
                 logger.warning(f"Archive path filter rejected {len(rejected)} file(s): {sorted(rejected)[:20]}")
 
             if allowed_files:
-                # Write filtered file list and extract only those
-                file_list_content = "\n".join(allowed_files) + "\n"
+                # GNU tar's --null reads names verbatim: no backslash
+                # unescaping or interpretation of leading '-' as options.
+                file_list_content = "\0".join(allowed_files) + "\0"
                 local_file_list = log_dir / "allowed_files.txt"
                 local_file_list.write_text(file_list_content)
                 backend.copy_to_container(handle, local_file_list, PurePosixPath("/tmp/allowed_files.txt"))
 
                 val = backend.exec_run(
                     handle,
-                    f"tar xzf {tar_path} -T /tmp/allowed_files.txt",
+                    f"tar xzf {tar_path} --null -T /tmp/allowed_files.txt",
                     workdir=task_spec.cwd,
                     user=DOCKER_USER,
                 )
