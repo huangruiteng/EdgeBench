@@ -789,7 +789,9 @@ def cmd_serve(args):
 
     app = create_app(config, checkpoints=args.checkpoints)
     print(f"Starting SForge judge server on port {args.port}")
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Registration/history credentials are currently query parameters. Uvicorn's
+    # default access log would persist the complete URL, including those secrets.
+    uvicorn.run(app, host=args.host, port=args.port, access_log=False)
 
 
 def cmd_proxy(args):

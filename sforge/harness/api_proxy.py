@@ -92,6 +92,7 @@ def _make_handler(
             fwd_headers["Host"] = parsed.hostname or parsed.netloc
             fwd_headers.update(host_headers)
 
+            response_started = False
             try:
                 resp = session.request(
                     method=self.command,
@@ -113,14 +114,25 @@ def _make_handler(
                         continue
                     self.send_header(key, val)
                 self.end_headers()
+                response_started = True
                 for chunk in resp.iter_content(chunk_size=None):
                     self.wfile.write(chunk)
                     self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                # A solver timeout or cancellation can close a streaming model
+                # response normally. The response socket is already unusable;
+                # attempting to write a secondary 502 only creates another
+                # exception and a noisy server traceback.
+                logger.debug("api-proxy client disconnected during response")
             except Exception as exc:
                 # Request exceptions can embed headers or request objects.  Do
                 # not reflect their text to the untrusted container or logs.
                 logger.warning("api-proxy upstream request failed: %s", type(exc).__name__)
-                self.send_error(502, "Upstream request failed")
+                if not response_started:
+                    try:
+                        self.send_error(502, "Upstream request failed")
+                    except (BrokenPipeError, ConnectionResetError):
+                        logger.debug("api-proxy client disconnected before error response")
 
         do_GET = do_request
         do_POST = do_request
