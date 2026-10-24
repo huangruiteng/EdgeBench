@@ -72,6 +72,21 @@ def rescale_score(spec: RescaleSpec | None, raw_score: float | None) -> float | 
     if spec is None or raw_score is None:
         return None
     raw = raw_score
+    # Some minimization judges use positive infinity as the task-native score
+    # for an incomplete or timed-out candidate.  That is a meaningful worst
+    # boundary, not a missing score: the finite formula below would clip it to
+    # zero if it could be evaluated directly.  Preserve NaN and infinities for
+    # all other mappings as unavailable rather than guessing their meaning.
+    if raw == math.inf and spec.kind in {
+        "min_linear",
+        "min_linear_positive",
+        "min_inverse_anchor",
+        "compression_ratio_cropped_guarded",
+        "log_min",
+        "piecewise_min",
+        "piecewise_log_min",
+    }:
+        return 0.0
     if not math.isfinite(raw):
         return None
 
