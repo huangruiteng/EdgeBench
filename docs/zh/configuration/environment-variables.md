@@ -43,7 +43,7 @@ SForge 大部分配置可通过 `SFORGE_*` 环境变量注入；仅 CLI/YAML 支
 
 | 变量 | 用途 |
 |------|------|
-| `SFORGE_AGENT_API_KEY` | 传递给所选 Agent 的 API 密钥，会映射为该 Agent 需要的环境变量（Claude Code 为 `ANTHROPIC_AUTH_TOKEN`，Codex 为 `CODEX_API_KEY`，OpenCode 为 `ANTHROPIC_API_KEY`） |
+| `SFORGE_AGENT_API_KEY` | 模型服务 API 密钥。Docker 上的 Codex 运行将真实密钥保留在单次运行的宿主网关中，Work 容器只接收非敏感占位值；其他已支持的 Agent／后端组合目前仍使用 Agent 对应的环境变量。 |
 | `SFORGE_AGENT_API_BASE_URL` | API Base URL 覆盖，会传递给所选 Agent 支持的 base-url 环境变量 |
 | `SFORGE_AGENT_MODEL` | Agent 模型覆盖 |
 | `SFORGE_AGENT_EFFORT` | Agent 推理强度（`low`、`medium`、`high` 或 `max`） |
@@ -64,6 +64,15 @@ SForge 大部分配置可通过 `SFORGE_*` 环境变量注入；仅 CLI/YAML 支
 对于 E2B，宿主机通用的 `HTTP_PROXY` / `HTTPS_PROXY` 不会自动传入 Work Sandbox。只有
 显式设置 `SFORGE_` 代理变量且远端能够访问该代理时才应转发；隔离模式始终移除代理并由
 E2B 原生域名白名单直接放行。
+:::
+
+::: info Docker Codex 凭据隔离
+在 Docker 后端运行 Codex 时，SForge 会启动单次运行专属的宿主网关，将上游固定为配置的
+API Base URL，并且只接受该 Work 容器 IP 的请求。网关用真实模型凭据替换容器发送的占位
+`Authorization` 请求头。真实密钥不会进入 Work 容器环境、命令行或 Codex Session 文件。
+
+这一能力目前不代表其他 Agent 或远程后端已经具备同等的凭据隔离；它们的模型服务认证
+协议和网络边界需要分别验证。
 :::
 
 ## Judge 变量

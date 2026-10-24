@@ -49,7 +49,9 @@ sforge run --task ad_placement_optimization --agent OpenCode
 
 ### API Key
 
-通过 `SFORGE_AGENT_API_KEY` 环境变量传入 API Key，SForge 会自动映射到对应 Agent 的环境变量（如 `ANTHROPIC_AUTH_TOKEN`、`CODEX_API_KEY` 等）：
+通过 `SFORGE_AGENT_API_KEY` 环境变量传入 API Key。Docker 上的 Codex 运行会把真实值保留在
+单次运行的宿主网关中，Work 容器只看到占位值；其他已支持的组合会映射到 Agent 对应的
+环境变量（例如 Claude Code 的 `ANTHROPIC_AUTH_TOKEN`）：
 
 ```bash
 SFORGE_AGENT_API_KEY="sk-xxxx" sforge run --task ad_placement_optimization --agent claude-code

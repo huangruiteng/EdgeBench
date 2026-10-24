@@ -43,7 +43,7 @@ Used when running agents via `sforge run`. These are injected as container envir
 
 | Variable | Purpose |
 |----------|---------|
-| `SFORGE_AGENT_API_KEY` | API key passed to the selected agent using that agent's expected env var (`ANTHROPIC_AUTH_TOKEN` for Claude Code, `CODEX_API_KEY` for Codex, `ANTHROPIC_API_KEY` for OpenCode) |
+| `SFORGE_AGENT_API_KEY` | Provider API key. Docker Codex runs keep the real key in a run-scoped host gateway and receive a non-secret placeholder; other qualified agent/backend combinations currently use the agent's expected environment variable. |
 | `SFORGE_AGENT_API_BASE_URL` | API base URL override passed through the selected agent's base-url env var when it has one |
 | `SFORGE_AGENT_MODEL` | Model override for the agent |
 | `SFORGE_AGENT_EFFORT` | Reasoning effort (`low`, `medium`, `high`, or `max`) |
@@ -65,6 +65,18 @@ For E2B, generic host `HTTP_PROXY` / `HTTPS_PROXY` variables are not forwarded
 to Work Sandboxes. Set the `SFORGE_` variants only when the proxy is reachable
 from E2B; isolated E2B runs always remove proxy variables and use the native
 host allowlist directly.
+:::
+
+::: info Docker Codex credential isolation
+For Codex on the Docker backend, SForge starts a run-scoped host gateway, pins it
+to the configured upstream API base URL, and accepts traffic only from that run's
+Work container IP. The gateway replaces the container's placeholder
+`Authorization` header with the real provider credential. The real key is not
+placed in the Work container environment, command line, or Codex session files.
+
+This protection does not yet claim equivalent credential isolation for other
+agents or remote backends. Their provider authentication protocols and network
+boundaries must be qualified separately.
 :::
 
 ## Judge Variables

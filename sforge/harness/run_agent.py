@@ -63,6 +63,10 @@ from sforge.harness.restored_registration import RestoredExecution, RestoredRegi
 from sforge.harness.task_spec import TaskSpec
 
 
+_CREDENTIAL_PLACEHOLDER = "sforge-host-credential"
+_USE_CONFIG_VALUE = object()
+
+
 @dataclass
 class RunResult:
     """Result of running an agent on a task."""
@@ -110,6 +114,9 @@ class RunResult:
 def _build_agent_env(
     agent: Agent,
     model: str | None = None,
+    *,
+    api_key_override: str | None | object = _USE_CONFIG_VALUE,
+    api_base_url_override: str | None | object = _USE_CONFIG_VALUE,
 ) -> dict[str, str]:
     """Build environment variables dict for an agent container."""
     config = agent._config
@@ -125,11 +132,21 @@ def _build_agent_env(
         env["no_proxy"] = config.no_proxy
         env["NO_PROXY"] = config.no_proxy
 
-    if config.agent_api_key:
-        env[agent.api_key_env] = config.agent_api_key
+    api_key = (
+        config.agent_api_key
+        if api_key_override is _USE_CONFIG_VALUE
+        else api_key_override
+    )
+    if api_key:
+        env[agent.api_key_env] = str(api_key)
 
-    if config.agent_api_base_url and agent.api_base_env:
-        env[agent.api_base_env] = config.agent_api_base_url
+    api_base_url = (
+        config.agent_api_base_url
+        if api_base_url_override is _USE_CONFIG_VALUE
+        else api_base_url_override
+    )
+    if api_base_url and agent.api_base_env:
+        env[agent.api_base_env] = str(api_base_url)
 
     effective_model = model or config.agent_model or agent.default_model
     if effective_model and agent.model_env:
@@ -144,7 +161,53 @@ def _build_agent_env(
 
     agent.augment_env(env, model)
 
+    # Agent hooks and extra_env may populate aliases for the same credential.
+    # Apply host-gateway overrides last so no real provider secret remains in
+    # the container environment.
+    if api_key_override is not _USE_CONFIG_VALUE:
+        credential_names = set(agent.credential_env_names)
+        credential_names.add(agent.api_key_env)
+        for name in credential_names:
+            env.pop(name, None)
+        if api_key_override:
+            env[agent.api_key_env] = str(api_key_override)
+    if api_base_url_override is not _USE_CONFIG_VALUE and agent.api_base_env:
+        if api_base_url_override:
+            env[agent.api_base_env] = str(api_base_url_override)
+        else:
+            env.pop(agent.api_base_env, None)
+
     return env
+
+
+def _prepare_credential_proxy(
+    agent: Agent,
+    config: SForgeConfig,
+    backend: ContainerBackend,
+):
+    """Prepare a Docker-hosted credential gateway when the protocol is known."""
+    if backend.backend_name != "docker" or not config.agent_api_key:
+        return None, None
+    headers = agent.credential_proxy_headers(config.agent_api_key)
+    if not headers:
+        return None, None
+    target_url = config.agent_api_base_url or agent.default_api_base_url
+    if not target_url or not agent.api_base_env:
+        raise ValueError(
+            f"Agent {agent.name!r} cannot use host credential isolation without "
+            "an API base URL environment"
+        )
+
+    from sforge.harness.api_proxy import APIProxy
+
+    proxy = APIProxy(
+        target_url=target_url,
+        http_proxy=config.http_proxy,
+        https_proxy=config.https_proxy,
+        host="0.0.0.0",
+        injected_headers=headers,
+    )
+    return proxy, f"http://host.docker.internal:{proxy.port}"
 
 
 def _e2b_install_env(env: dict[str, str], agent: Agent) -> dict[str, str]:
@@ -678,6 +741,8 @@ def run_agent(
 
     handle = None
     net_isolation = None
+    credential_proxy = None
+    credential_proxy_url = None
     # Cleanup and interruption handlers can run before installation completes.
     auto_eval_stop = None
     auto_eval_thread = None
@@ -784,7 +849,18 @@ def run_agent(
 
         backend.remove_container_by_name(container_name)
 
-        env = _build_agent_env(agent, model)
+        credential_proxy, credential_proxy_url = _prepare_credential_proxy(
+            agent, config, backend,
+        )
+        if credential_proxy is not None:
+            env = _build_agent_env(
+                agent,
+                model,
+                api_key_override=_CREDENTIAL_PLACEHOLDER,
+                api_base_url_override=credential_proxy_url,
+            )
+        else:
+            env = _build_agent_env(agent, model)
         if backend.backend_name == "e2b":
             sanitize_e2b_proxy_env(env, internet=internet)
         env["SFORGE_FEEDBACK_URL"] = (
@@ -805,11 +881,15 @@ def run_agent(
             env["GAME_SERVER_URL"] = game_api_base
 
         # Ensure judge server URL bypasses proxy
-        judge_host = urlparse(judge_url).hostname or ""
+        bypass_hosts = {urlparse(judge_url).hostname or ""}
+        if credential_proxy_url:
+            bypass_hosts.add(urlparse(credential_proxy_url).hostname or "")
         for key in ("NO_PROXY", "no_proxy"):
             existing = env.get(key, "")
-            if judge_host and judge_host not in existing:
-                env[key] = f"{existing},{judge_host}" if existing else judge_host
+            parts = {part.strip() for part in existing.split(",") if part.strip()}
+            parts.update(host for host in bypass_hosts if host)
+            if parts:
+                env[key] = ",".join(sorted(parts))
 
         # Network isolation: preflight + extra_hosts pre-resolve
         container_extra_hosts = {"host.docker.internal": "host-gateway"}
@@ -824,7 +904,7 @@ def run_agent(
                 check_iptables_permission,
             )
 
-            if config.http_proxy or config.https_proxy:
+            if (config.http_proxy or config.https_proxy) and credential_proxy is None:
                 raise RuntimeError(
                     "Network isolation (internet=false) is not compatible with "
                     "direct proxy configuration. Start a local API proxy first:\n"
@@ -845,7 +925,11 @@ def run_agent(
                 resolve_hostname,
             )
 
-            api_url = config.agent_api_base_url or agent.default_api_base_url
+            api_url = (
+                credential_proxy_url
+                or config.agent_api_base_url
+                or agent.default_api_base_url
+            )
             if api_url:
                 api_host = urlparse(api_url).hostname or ""
                 if (
@@ -880,6 +964,14 @@ def run_agent(
             user="agent" if backend.backend_name == "e2b" else None,
         )
         backend.start_container(handle)
+        if credential_proxy is not None:
+            container_ip = backend.get_container_ip(handle)
+            if not container_ip:
+                raise RuntimeError(
+                    "Cannot determine container IP for credential isolation"
+                )
+            credential_proxy.restrict_clients({container_ip})
+            credential_proxy.start()
         logger.info(f"Container started: {container_name} (judge_url={judge_url})")
 
         # 3. Install agent runtime
@@ -954,7 +1046,11 @@ def run_agent(
                     "Cannot determine gateway IP for network isolation"
                 )
 
-            effective_api_url = config.agent_api_base_url or agent.default_api_base_url
+            effective_api_url = (
+                credential_proxy_url
+                or config.agent_api_base_url
+                or agent.default_api_base_url
+            )
             endpoints = build_allowed_endpoints(
                 judge_url, effective_api_url, gateway_ip, logger,
                 resolve_hostnames=backend.backend_name != "e2b",
@@ -1381,6 +1477,10 @@ def run_agent(
             else:
                 backend.cleanup_container(handle, logger)
         finally:
-            if restored_execution is not None:
-                restored_execution.close()
-            close_logger(logger)
+            try:
+                if credential_proxy is not None:
+                    credential_proxy.stop()
+            finally:
+                if restored_execution is not None:
+                    restored_execution.close()
+                close_logger(logger)

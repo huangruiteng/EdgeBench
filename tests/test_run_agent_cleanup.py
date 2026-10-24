@@ -37,6 +37,11 @@ class SyntheticAgent(Agent):
     install_cmds: ClassVar[list[str]] = ["install-synthetic-agent"]
     run_cmd = "run-synthetic-agent {prompt_file}"
     api_key_env = "SYNTHETIC_API_KEY"
+    api_base_env = "SYNTHETIC_API_BASE"
+    credential_env_names = ("SYNTHETIC_API_KEY", "SYNTHETIC_API_KEY_ALIAS")
+
+    def credential_proxy_headers(self, api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
 
 
 @pytest.fixture
@@ -88,6 +93,7 @@ def harness(monkeypatch, tmp_path):
         )
 
     yield SimpleNamespace(backend=backend, handle=handle, run=run, close=closed,
+                          config=config,
                           archive=archive, history=history, previous_sigint=previous_sigint)
     signal.signal(signal.SIGINT, previous_sigint)
 
@@ -97,6 +103,60 @@ def assert_cleaned(harness, handle):
     assert harness.backend.cleanup_container.call_args.args[0] is handle
     harness.close.assert_called_once()
     assert signal.getsignal(signal.SIGINT) == harness.previous_sigint
+
+
+def test_docker_provider_credential_stays_in_host_gateway(harness, monkeypatch, tmp_path):
+    provider_secret = "synthetic-provider-secret"
+    proxies = []
+
+    class FakeProxy:
+        def __init__(self, **kwargs):
+            self.port = 43123
+            self.kwargs = kwargs
+            self.started = False
+            self.stopped = False
+            self.allowed_ips = None
+            proxies.append(self)
+
+        def restrict_clients(self, allowed_ips):
+            self.allowed_ips = set(allowed_ips)
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr("sforge.harness.api_proxy.APIProxy", FakeProxy)
+    harness.config.agent_api_key = provider_secret
+    harness.config.agent_api_base_url = "https://provider.example/v1"
+    harness.config.agent_extra_env.update({
+        "SYNTHETIC_API_KEY": provider_secret,
+        "SYNTHETIC_API_KEY_ALIAS": provider_secret,
+    })
+    harness.backend.get_container_ip.return_value = "192.0.2.7"
+
+    result = harness.run()
+
+    assert result.agent_output == "solver-output"
+    assert len(proxies) == 1
+    proxy = proxies[0]
+    assert proxy.started and proxy.stopped
+    assert proxy.allowed_ips == {"192.0.2.7"}
+    assert proxy.kwargs["target_url"] == "https://provider.example/v1"
+    assert proxy.kwargs["injected_headers"] == {
+        "Authorization": f"Bearer {provider_secret}",
+    }
+
+    container_env = harness.backend.create_container.call_args.kwargs["environment"]
+    assert container_env["SYNTHETIC_API_KEY"] == "sforge-host-credential"
+    assert "SYNTHETIC_API_KEY_ALIAS" not in container_env
+    assert container_env["NO_PROXY"].split(",") == ["host.docker.internal"]
+    assert container_env["no_proxy"].split(",") == ["host.docker.internal"]
+    assert provider_secret not in repr(harness.backend.mock_calls)
+    for artifact in tmp_path.rglob("*"):
+        if artifact.is_file():
+            assert provider_secret not in artifact.read_text(errors="replace")
 
 
 @pytest.mark.parametrize("backend_name", ["docker", "k8s", "e2b"])

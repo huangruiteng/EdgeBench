@@ -46,6 +46,10 @@ class Agent(abc.ABC):
     timeout: int = 3600
     stop_hook: str | None = None
     resume_cmd: str | None = None
+    # Every environment name through which this agent may consume the same
+    # provider credential.  The runner removes all of them before installing a
+    # host-side credential gateway.
+    credential_env_names: tuple[str, ...] = ()
 
     def __init__(self, config: SForgeConfig) -> None:
         self._config = config
@@ -60,6 +64,14 @@ class Agent(abc.ABC):
         Called **after** the generic env vars (proxy, API key, model,
         mirrors, extra_env) have already been applied.
         """
+
+    def credential_proxy_headers(self, api_key: str) -> dict[str, str]:
+        """Return host-only upstream authentication headers for *api_key*.
+
+        An empty mapping means that this agent's provider authentication
+        protocol has not been qualified for host-side injection yet.
+        """
+        return {}
 
     def format_run_cmd(
         self,

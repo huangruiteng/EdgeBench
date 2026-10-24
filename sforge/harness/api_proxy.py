@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Local reverse proxy for API access through an upstream HTTP(S) proxy.
+"""Local reverse proxy for host-controlled provider API access.
 
 When network isolation is enabled (internet=false) but the API endpoint
 requires a corporate proxy, we cannot set proxy env vars inside the
@@ -49,9 +49,17 @@ def _find_free_port(host: str = "0.0.0.0") -> int:
         return s.getsockname()[1]
 
 
-def _make_handler(target_url: str, session: req_lib.Session):
+def _make_handler(
+    target_url: str,
+    session: req_lib.Session,
+    injected_headers: dict[str, str] | None = None,
+    client_policy: dict[str, set[str] | None] | None = None,
+):
     """Create a request handler class that proxies to target_url via session."""
     target_base = target_url.rstrip("/")
+    host_headers = dict(injected_headers or {})
+    replaced_header_names = {key.lower() for key in host_headers}
+    policy = client_policy if client_policy is not None else {"allowed_ips": None}
 
     class ProxyHandler(BaseHTTPRequestHandler):
         # HTTP/1.0: connection close signals end-of-body, no need for
@@ -59,6 +67,10 @@ def _make_handler(target_url: str, session: req_lib.Session):
         protocol_version = "HTTP/1.0"
 
         def do_request(self):
+            allowed_ips = policy["allowed_ips"]
+            if allowed_ips is not None and self.client_address[0] not in allowed_ips:
+                self.send_error(403, "Client is not allowed")
+                return
             upstream_url = f"{target_base}{self.path}"
 
             body = None
@@ -68,11 +80,17 @@ def _make_handler(target_url: str, session: req_lib.Session):
 
             fwd_headers = {}
             for key, val in self.headers.items():
-                if key.lower() in ("host", "transfer-encoding", "accept-encoding"):
+                if key.lower() in (
+                    "host",
+                    "transfer-encoding",
+                    "accept-encoding",
+                    "proxy-authorization",
+                ) or key.lower() in replaced_header_names:
                     continue
                 fwd_headers[key] = val
             parsed = urlparse(target_base)
             fwd_headers["Host"] = parsed.hostname or parsed.netloc
+            fwd_headers.update(host_headers)
 
             try:
                 resp = session.request(
@@ -99,7 +117,10 @@ def _make_handler(target_url: str, session: req_lib.Session):
                     self.wfile.write(chunk)
                     self.wfile.flush()
             except Exception as exc:
-                self.send_error(502, str(exc))
+                # Request exceptions can embed headers or request objects.  Do
+                # not reflect their text to the untrusted container or logs.
+                logger.warning("api-proxy upstream request failed: %s", type(exc).__name__)
+                self.send_error(502, "Upstream request failed")
 
         do_GET = do_request
         do_POST = do_request
@@ -125,8 +146,14 @@ class APIProxy:
         https_proxy: str | None = None,
         host: str = "0.0.0.0",
         port: int | None = None,
+        injected_headers: dict[str, str] | None = None,
     ) -> None:
         self.target_url = target_url.rstrip("/")
+        parsed_target = urlparse(self.target_url)
+        if parsed_target.scheme not in ("http", "https") or not parsed_target.hostname:
+            raise ValueError("API proxy target must be an absolute HTTP(S) URL")
+        if parsed_target.username is not None or parsed_target.password is not None:
+            raise ValueError("API proxy target must not contain credentials")
         self.host = host
         self.port = port or _find_free_port(host)
 
@@ -138,7 +165,13 @@ class APIProxy:
             proxies["https"] = https_proxy
         self._session.proxies = proxies
 
-        handler = _make_handler(self.target_url, self._session)
+        self._client_policy: dict[str, set[str] | None] = {"allowed_ips": None}
+        handler = _make_handler(
+            self.target_url,
+            self._session,
+            injected_headers=injected_headers,
+            client_policy=self._client_policy,
+        )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread: threading.Thread | None = None
 
@@ -160,6 +193,14 @@ class APIProxy:
         )
         return self.local_url
 
+    def restrict_clients(self, allowed_ips: set[str]) -> None:
+        """Restrict requests to exact client IPs before serving traffic."""
+        if self._thread is not None:
+            raise RuntimeError("API proxy client policy cannot change after start")
+        if not allowed_ips:
+            raise ValueError("API proxy requires at least one allowed client IP")
+        self._client_policy["allowed_ips"] = set(allowed_ips)
+
     def run_forever(self) -> None:
         """Run the proxy in the foreground (blocks until SIGINT/SIGTERM)."""
         original_sigint = signal.getsignal(signal.SIGINT)
@@ -180,8 +221,9 @@ class APIProxy:
             signal.signal(signal.SIGTERM, original_sigterm)
 
     def stop(self) -> None:
-        self._server.shutdown()
         if self._thread:
+            self._server.shutdown()
             self._thread.join(timeout=5)
+        self._server.server_close()
         self._session.close()
         logger.info("API proxy stopped")
