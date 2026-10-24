@@ -108,6 +108,69 @@ def test_host_headers_replace_container_credentials():
         upstream_thread.join(timeout=5)
 
 
+def test_proxy_streams_upstream_events_before_response_completion():
+    first_upstream_event = threading.Event()
+    release_upstream = threading.Event()
+    first_downstream_event = threading.Event()
+    consumer_finished = threading.Event()
+    consumer_errors: list[Exception] = []
+
+    class UpstreamHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"data: first\n\n")
+            self.wfile.flush()
+            first_upstream_event.set()
+            release_upstream.wait(timeout=5)
+            self.wfile.write(b"data: second\n\n")
+            self.wfile.flush()
+
+        def log_message(self, format, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    upstream_thread.start()
+    proxy = APIProxy(
+        target_url=f"http://127.0.0.1:{upstream.server_port}/provider/v1",
+        host="127.0.0.1",
+    )
+    proxy._session.trust_env = False
+    proxy.start()
+
+    def consume_first_event():
+        try:
+            with _direct_session() as client:
+                with client.get(proxy.local_url + "/responses", stream=True, timeout=5) as response:
+                    response.raise_for_status()
+                    received = b""
+                    for chunk in response.iter_content(chunk_size=1):
+                        received += chunk
+                        if b"\n\n" in received:
+                            first_downstream_event.set()
+                            break
+        except Exception as exc:
+            consumer_errors.append(exc)
+        finally:
+            consumer_finished.set()
+
+    consumer = threading.Thread(target=consume_first_event, daemon=True)
+    consumer.start()
+    try:
+        assert first_upstream_event.wait(timeout=2)
+        assert first_downstream_event.wait(timeout=1)
+    finally:
+        release_upstream.set()
+        consumer_finished.wait(timeout=5)
+        proxy.stop()
+        upstream.shutdown()
+        upstream.server_close()
+        upstream_thread.join(timeout=5)
+    assert not consumer_errors
+
+
 def test_proxy_generated_error_does_not_reflect_host_secret(caplog):
     provider_secret = _HOST_TOKEN
     proxy = APIProxy(
