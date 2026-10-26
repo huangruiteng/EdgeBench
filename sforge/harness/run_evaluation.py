@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import tarfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath
@@ -57,22 +58,30 @@ def _filter_archive_files(
     A file is allowed if:
       1. It falls under at least one submit_paths entry (prefix match, or "." allows all)
       2. It does NOT match any submit_exclude pattern (prefix or fnmatch glob)
-      3. It is not a directory entry (trailing /)
+      3. It is a relative path without parent traversal or NUL characters
+      4. It is not a directory entry (trailing /)
+
+    Match canonical relative paths, but return the exact archive spelling for
+    extraction. Whitespace and backslashes are legal filename characters.
     """
     allowed: list[str] = []
     for f in file_list:
-        f = f.strip()
-        if not f or f.endswith("/"):
+        path = PurePosixPath(f)
+        if (not f or f.endswith("/") or "\0" in f or path.is_absolute()
+                or ".." in path.parts or str(path) == "."):
             continue
+        canonical = str(path)
 
         # Whitelist: must be under at least one submit_paths entry
         in_whitelist = False
         for sp in submit_paths:
-            sp = sp.rstrip("/")
+            if not sp:
+                continue
+            sp = str(PurePosixPath(sp))
             if sp == ".":
                 in_whitelist = True
                 break
-            if f == sp or f.startswith(sp + "/"):
+            if canonical == sp or canonical.startswith(sp + "/"):
                 in_whitelist = True
                 break
         if not in_whitelist:
@@ -81,15 +90,15 @@ def _filter_archive_files(
         # Blacklist: reject if any exclude pattern matches
         excluded = False
         for exc in submit_exclude:
-            exc = exc.rstrip("/")
-            if f == exc or f.startswith(exc + "/"):
+            exc = str(PurePosixPath(exc))
+            if canonical == exc or canonical.startswith(exc + "/"):
                 excluded = True
                 break
-            basename = f.rsplit("/", 1)[-1]
+            basename = path.name
             if fnmatch.fnmatch(basename, exc):
                 excluded = True
                 break
-            if fnmatch.fnmatch(f, exc):
+            if fnmatch.fnmatch(canonical, exc):
                 excluded = True
                 break
         if excluded:
@@ -187,44 +196,38 @@ def judge_submission(
             tar_path = PurePosixPath("/tmp/submission.tar.gz")
             backend.copy_to_container(handle, local_tar, tar_path)
 
-            # List archive contents
-            list_result = backend.exec_run(
-                handle,
-                # --quoting-style=literal: GNU tar octal-escapes non-ASCII
-                # names in listings under some locales, which breaks the
-                # submit_paths match for CJK filenames
-                f"tar --quoting-style=literal -tzf {tar_path}",
-                workdir=task_spec.cwd,
-                user=DOCKER_USER,
-            )
-            if list_result.exit_code != 0:
-                err_msg = list_result.output
-                logger.error(f"Archive listing failed: {err_msg}")
-                raise EvaluationError(
-                    task_spec.task_id,
-                    f"Archive listing failed: {err_msg}",
-                    logger,
-                )
-
-            all_files = list_result.output.splitlines()
+            # Parse member headers, not tar's human-readable listing: names can
+            # contain newlines, control characters and non-ASCII bytes. Only
+            # inspect on the host; extraction remains inside the judge.
+            with tarfile.open(local_tar, "r:gz", encoding="utf-8",
+                              errors="surrogateescape") as archive_info:
+                all_files = [member.name for member in archive_info
+                             if not member.isdir()]
             allowed_files = _filter_archive_files(
                 all_files, task_spec.submit_paths, task_spec.submit_exclude,
             )
 
-            rejected = set(f.strip() for f in all_files if f.strip() and not f.strip().endswith("/")) - set(allowed_files)
+            rejected = set(all_files) - set(allowed_files)
             if rejected:
                 logger.warning(f"Archive path filter rejected {len(rejected)} file(s): {sorted(rejected)[:20]}")
 
             if allowed_files:
-                # Write filtered file list and extract only those
-                file_list_content = "\n".join(allowed_files) + "\n"
-                local_file_list = log_dir / "allowed_files.txt"
-                local_file_list.write_text(file_list_content)
-                backend.copy_to_container(handle, local_file_list, PurePosixPath("/tmp/allowed_files.txt"))
+                # NUL + verbatim avoids line splitting, trimming, unescaping
+                # and option parsing. Deduplicate selectors (tar still applies
+                # archive entries in order), and never recursively extract a
+                # selected name: descendants must pass their own path filter.
+                file_list_content = b"".join(
+                    name.encode("utf-8", "surrogateescape") + b"\0"
+                    for name in dict.fromkeys(allowed_files)
+                )
+                local_file_list = log_dir / "allowed_files.nul"
+                local_file_list.write_bytes(file_list_content)
+                backend.copy_to_container(handle, local_file_list, PurePosixPath("/tmp/allowed_files.nul"))
 
                 val = backend.exec_run(
                     handle,
-                    f"tar xzf {tar_path} -T /tmp/allowed_files.txt",
+                    f"tar xzf {tar_path} --no-recursion --null "
+                    "--verbatim-files-from -T /tmp/allowed_files.nul",
                     workdir=task_spec.cwd,
                     user=DOCKER_USER,
                 )

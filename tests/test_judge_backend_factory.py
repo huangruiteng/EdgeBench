@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -137,10 +139,15 @@ def test_http_registration_override_uses_app_factory(tmp_path, output, expected)
         )
         assert response.status_code == 200
         token = response.json()["token"]
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as archive:
+            member = tarfile.TarInfo("solution")
+            member.size = len(b"synthetic")
+            archive.addfile(member, io.BytesIO(b"synthetic"))
         submission = client.post(
             "/api/v1/submit",
             data={"token": token},
-            files={"archive": ("patch.tar.gz", b"synthetic")},
+            files={"archive": ("patch.tar.gz", raw.getvalue())},
         )
         assert submission.status_code == 200
         submission_id = submission.json()["submission_id"]
@@ -155,7 +162,7 @@ def test_http_registration_override_uses_app_factory(tmp_path, output, expected)
         if isinstance(output, Exception):
             assert result["status"] == "error"
             assert result["report"] is None
-            assert result["error"]
+            assert result["error"] == "judge_execution_failed:execute_evaluation"
             assert "synthetic backend failure" not in result["error"]
         else:
             assert result["status"] == "completed"
