@@ -137,6 +137,25 @@ When filing a bug report, please include:
 
 ## Shared contributor integration
 
+### Host API rate-limit recovery
+
+`SFORGE_AGENT_RATE_LIMIT_RETRY_SECONDS=900` enables up to a 15-minute HTTP 429
+retry window in the Docker host credential gateway. The default is zero (pass
+through). `SForgeConfig.agent_rate_limit_retry_seconds` is the programmatic
+equivalent. Freeze this setting with the runner revision for new experiments.
+It is transport recovery and does not change task, scoring, session, or budget
+semantics. It does not apply to routes without this credential gateway.
+
+The gateway honors `Retry-After` seconds or HTTP dates; otherwise it uses
+exponential backoff with jitter, starting near 5 seconds and capped at 60 seconds.
+A requested delay beyond the remaining window preserves the last 429. Client
+disconnect and proxy shutdown cancel the wait and prevent another request.
+Other status codes and responses already forwarded are never replayed by this
+policy. Existing in-flight requests retain their request timeout. Logs contain
+retry counts and delays, not prompts, response bodies, or authorization headers.
+
+### Integration source
+
 The shared candidate for contributions from `huangruiteng` and `loopx-agent` is
 [`huangruiteng/EdgeBench:codex/edgebench-integration`](https://github.com/huangruiteng/EdgeBench/tree/codex/edgebench-integration).
 Both accounts should target this branch for composed validation. Upstream PRs

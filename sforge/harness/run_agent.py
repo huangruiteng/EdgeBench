@@ -207,6 +207,7 @@ def _prepare_credential_proxy(
         https_proxy=config.https_proxy,
         host="0.0.0.0",
         injected_headers=headers,
+        rate_limit_retry_seconds=config.agent_rate_limit_retry_seconds,
     )
     return proxy, f"http://host.docker.internal:{proxy.port}"
 
