@@ -230,6 +230,37 @@ def _e2b_install_env(env: dict[str, str], agent: Agent) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _install_task_file(
+    backend: ContainerBackend,
+    handle: ContainerHandle,
+    source: Path,
+    destination: PurePosixPath,
+    *,
+    executable: bool = False,
+) -> None:
+    """Install solver-visible data without inheriting private host permissions.
+
+    Archive transfer can preserve the host UID and a restrictive umask. Only
+    these generated, non-secret task files are made readable in the container;
+    the host copy and general file-transfer semantics remain unchanged.
+    """
+    backend.copy_to_container(handle, source, destination)
+    mode = "0755" if executable else "0644"
+    result = backend.exec_run(
+        handle, ["chmod", mode, str(destination)], user="root"
+    )
+    if result.exit_code != 0:
+        raise RuntimeError(f"Cannot install task file permissions: {destination}")
+    # Test as the solver, not as the privileged installer. Scripts require read
+    # permission as well as execute permission for their interpreter to work.
+    for permission in (["-r", "-x"] if executable else ["-r"]):
+        result = backend.exec_run(
+            handle, ["test", permission, str(destination)], user="agent"
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(f"Task file unavailable to solver: {destination}")
+
+
 def _install_tools(
     backend: ContainerBackend,
     handle: ContainerHandle,
@@ -245,10 +276,10 @@ def _install_tools(
     submit_script = generate_submit_script()
     local_submit = log_dir / "_sforge-submit.sh"
     local_submit.write_text(submit_script)
-    backend.copy_to_container(
-        handle, local_submit, PurePosixPath("/usr/local/bin/sforge-submit")
+    _install_task_file(
+        backend, handle, local_submit, PurePosixPath("/usr/local/bin/sforge-submit"),
+        executable=True,
     )
-    backend.exec_run(handle, "chmod a+x /usr/local/bin/sforge-submit", user="root")
     logger.info("Installed sforge-submit script")
 
     # 2. Install agent-specific stop hook (unless disabled)
@@ -1218,8 +1249,7 @@ def run_agent(
         prompt_path = "/tmp/agent_prompt.md"
         local_prompt = log_dir / "agent_prompt.md"
         local_prompt.write_text(prompt)
-        backend.copy_to_container(handle, local_prompt, PurePosixPath(prompt_path))
-        backend.exec_run(handle, f"chmod a+r {prompt_path}")
+        _install_task_file(backend, handle, local_prompt, PurePosixPath(prompt_path))
         logger.info(f"Prompt written ({len(prompt)} bytes)")
 
         # 6. Run agent (with auto-resume on abnormal exit)

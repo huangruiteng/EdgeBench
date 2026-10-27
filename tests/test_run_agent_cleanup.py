@@ -60,6 +60,7 @@ def harness(monkeypatch, tmp_path):
     backend = Mock(spec=ContainerBackend)
     backend.backend_name = "docker"
     backend.image_exists.return_value = True
+    backend.exec_run.return_value = StreamingExecResult(output="", exit_code=0)
     handle = backend.create_container.return_value
     backend.exec_run_with_exit_code.return_value = StreamingExecResult(output="installed")
     backend.exec_run_with_timeout.side_effect = [

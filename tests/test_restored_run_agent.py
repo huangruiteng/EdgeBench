@@ -84,6 +84,7 @@ def entry(service, monkeypatch):  # noqa: F811 - imported pytest fixture
         runner, "_extract_archive_from_container", lambda *args, **kwargs: b"fixture"
     )
     backend = Mock(backend_name="docker")
+    backend.exec_run.return_value = SimpleNamespace(output="", exit_code=0)
     backend.image_exists.return_value = True
     backend.exec_run_with_exit_code.return_value = SimpleNamespace(
         output="installed", exit_code=0, timed_out=False, elapsed_seconds=0
