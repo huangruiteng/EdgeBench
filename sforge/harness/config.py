@@ -41,6 +41,9 @@ class SForgeConfig:
     # Agent configuration
     agent_api_key: str | None = None
     agent_api_base_url: str | None = None
+    # Host gateway retries only HTTP 429 before forwarding any response bytes.
+    # Zero preserves the historical pass-through behavior.
+    agent_rate_limit_retry_seconds: int = 0
     agent_model: str | None = None
     # Reasoning effort, canonical vocabulary "low"/"medium"/"high"/"max";
     # each agent translates to its native mechanism (env var, CLI flag or
@@ -127,6 +130,7 @@ def load_config(cli_overrides: dict | None = None) -> SForgeConfig:
         "apt_mirror_url": ["SFORGE_APT_MIRROR_URL"],
         "agent_api_key": ["SFORGE_AGENT_API_KEY"],
         "agent_api_base_url": ["SFORGE_AGENT_API_BASE_URL"],
+        "agent_rate_limit_retry_seconds": ["SFORGE_AGENT_RATE_LIMIT_RETRY_SECONDS"],
         "agent_model": ["SFORGE_AGENT_MODEL"],
         "agent_effort": ["SFORGE_AGENT_EFFORT"],
         "agent_timeout": ["SFORGE_AGENT_TIMEOUT"],

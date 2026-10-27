@@ -32,10 +32,14 @@ Usage (separate terminal):
 from __future__ import annotations
 
 import logging
+import math
+import random
+import select
 import signal
 import socket
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, urlsplit
 
@@ -43,6 +47,38 @@ import requests as req_lib
 
 logger = logging.getLogger(__name__)
 _STREAM_READ_SIZE = 64 * 1024
+
+
+def _rate_limit_delay(value: str | None, attempt: int) -> float:
+    """Respect Retry-After (seconds or HTTP date); jitter only the fallback."""
+    if value:
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                delay = parsedate_to_datetime(value).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                delay = float("nan")
+        if math.isfinite(delay) and delay >= 0:
+            return max(1.0, delay)
+    return min(60.0, 5.0 * 2 ** min(attempt - 1, 4)) * random.uniform(0.8, 1.0)
+
+
+def _wait_for_retry(connection: socket.socket, stopped: threading.Event, delay: float) -> bool:
+    """A cancelled client or stopped trial must not start another paid request."""
+    until = time.monotonic() + delay
+    while not stopped.is_set():
+        try:
+            readable, _, _ = select.select([connection], [], [], 0)
+            if readable and not connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                return False
+        except (OSError, ValueError):
+            return False
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return True
+        stopped.wait(min(remaining, 0.25))
+    return False
 
 
 def _find_free_port(host: str = "0.0.0.0") -> int:
@@ -56,12 +92,15 @@ def _make_handler(
     session: req_lib.Session,
     injected_headers: dict[str, str] | None = None,
     client_policy: dict[str, set[str] | None] | None = None,
+    rate_limit_retry_seconds: int = 0,
+    stopped: threading.Event | None = None,
 ):
     """Create a request handler class that proxies to target_url via session."""
     target_base = target_url.rstrip("/")
     host_headers = dict(injected_headers or {})
     replaced_header_names = {key.lower() for key in host_headers}
     policy = client_policy if client_policy is not None else {"allowed_ips": None}
+    stop_event = stopped if stopped is not None else threading.Event()
 
     class ProxyHandler(BaseHTTPRequestHandler):
         # HTTP/1.0: connection close signals end-of-body, no need for
@@ -77,6 +116,7 @@ def _make_handler(
             first_byte_at = None
             chunk_count = 0
             terminal_reason = "upstream_error"
+            rate_limit_retries = 0
             allowed_ips = policy["allowed_ips"]
             if allowed_ips is not None and self.client_address[0] not in allowed_ips:
                 self.send_error(403, "Client is not allowed")
@@ -105,14 +145,34 @@ def _make_handler(
 
             response_started = False
             try:
-                with session.request(
-                    method=self.command,
-                    url=upstream_url,
-                    headers=fwd_headers,
-                    data=body,
-                    timeout=300,
-                    stream=True,
-                ) as resp:
+                while True:
+                    resp = session.request(
+                        method=self.command,
+                        url=upstream_url,
+                        headers=fwd_headers,
+                        data=body,
+                        timeout=300,
+                        stream=True,
+                    )
+                    if resp.status_code != 429 or not rate_limit_retry_seconds:
+                        break
+                    delay = _rate_limit_delay(resp.headers.get("Retry-After"), rate_limit_retries + 1)
+                    remaining = rate_limit_retry_seconds - (time.monotonic() - started_at)
+                    if delay >= remaining:
+                        break  # Preserve the last 429 and its original headers/body.
+                    logger.info(
+                        "api-proxy rate_limit_retry=%d delay_seconds=%.3f observed_at_epoch=%.3f",
+                        rate_limit_retries + 1, delay, time.time(),
+                    )
+                    if not _wait_for_retry(self.connection, stop_event, delay):
+                        resp.close()
+                        terminal_reason = "retry_cancelled"
+                        return
+                    if time.monotonic() - started_at >= rate_limit_retry_seconds:
+                        break  # A delayed wake must preserve this response too.
+                    resp.close()
+                    rate_limit_retries += 1
+                with resp:
                     status = resp.status_code
                     content_type = resp.headers.get("Content-Type")
                     self.send_response(resp.status_code)
@@ -168,7 +228,7 @@ def _make_handler(
                 logger.info(
                     "api-proxy request method=%s path=%s body_size=%d "
                     "status=%s content_type=%s ttfb_ms=%s chunk_count=%d "
-                    "terminal_reason=%s",
+                    "terminal_reason=%s rate_limit_retries=%d",
                     self.command,
                     request_path,
                     body_size,
@@ -177,6 +237,7 @@ def _make_handler(
                     ttfb_ms,
                     chunk_count,
                     terminal_reason,
+                    rate_limit_retries,
                 )
 
         do_GET = do_request
@@ -204,7 +265,11 @@ class APIProxy:
         host: str = "0.0.0.0",
         port: int | None = None,
         injected_headers: dict[str, str] | None = None,
+        rate_limit_retry_seconds: int = 0,
     ) -> None:
+        if type(rate_limit_retry_seconds) is not int or rate_limit_retry_seconds < 0:
+            raise ValueError("rate_limit_retry_seconds must be a nonnegative integer")
+        self.rate_limit_retry_seconds = rate_limit_retry_seconds
         self.target_url = target_url.rstrip("/")
         parsed_target = urlparse(self.target_url)
         if parsed_target.scheme not in ("http", "https") or not parsed_target.hostname:
@@ -223,11 +288,14 @@ class APIProxy:
         self._session.proxies = proxies
 
         self._client_policy: dict[str, set[str] | None] = {"allowed_ips": None}
+        self._stopped = threading.Event()
         handler = _make_handler(
             self.target_url,
             self._session,
             injected_headers=injected_headers,
             client_policy=self._client_policy,
+            rate_limit_retry_seconds=rate_limit_retry_seconds,
+            stopped=self._stopped,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread: threading.Thread | None = None
@@ -264,6 +332,7 @@ class APIProxy:
         original_sigterm = signal.getsignal(signal.SIGTERM)
 
         def _shutdown(signum, frame):
+            self._stopped.set()
             print("\nShutting down API proxy...")
             threading.Thread(
                 target=self._server.shutdown, daemon=True
@@ -278,6 +347,7 @@ class APIProxy:
             signal.signal(signal.SIGTERM, original_sigterm)
 
     def stop(self) -> None:
+        self._stopped.set()
         if self._thread:
             self._server.shutdown()
             self._thread.join(timeout=5)
