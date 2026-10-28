@@ -540,16 +540,27 @@ def _wait_for_grading(host_judge_url: str, session_token: str, admin_secret: str
     ):
         raise ValueError("max_wait_seconds must be finite and positive")
     per_evaluation_budget = max(900.0, float(eval_timeout) + 600.0)
-    budget = min(per_evaluation_budget, max_wait_seconds) if max_wait_seconds is not None else per_evaluation_budget
+    budget = per_evaluation_budget
+    hard_deadline = (
+        time.monotonic() + max_wait_seconds
+        if max_wait_seconds is not None else None
+    )
     queue_budget_frozen = False
+    previously_queue_only = False
     read_history = history_reader or _read_grading_history
     started = time.monotonic()
     deadline = started + budget
+    last_accounted = started
     history = None
     pending = None
     last_read_ok = False
     while True:
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        if previously_queue_only:
+            deadline += max(0.0, now - last_accounted)
+        last_accounted = now
+        effective_deadline = min(deadline, hard_deadline) if hard_deadline is not None else deadline
+        remaining = effective_deadline - now
         if remaining <= 0:
             break
         try:
@@ -563,30 +574,47 @@ def _wait_for_grading(host_judge_url: str, session_token: str, admin_secret: str
             last_read_ok = False
             # Request exceptions can contain token-bearing URLs.
             logger.warning("Grading history unavailable (%s)", type(exc).__name__)
+        now = time.monotonic()
+        if previously_queue_only:
+            deadline += max(0.0, now - last_accounted)
+        last_accounted = now
+        pending_statuses = []
+        if last_read_ok:
+            pending_statuses = [
+                entry.get("status")
+                for entry in history["entries"]
+                if entry.get("status") in ("queued", "running")
+            ]
+        queue_only = bool(pending_statuses) and all(
+            status == "queued" for status in pending_statuses
+        )
         interrupted = shutdown_event is not None and shutdown_event.is_set()
         if incomplete_reason or interrupted:
             return _GradingResult(
                 history, "pending" if last_read_ok and pending else "unknown",
                 incomplete_reason or "interrupted", pending if last_read_ok else None,
-                time.monotonic() - started, budget,
+                now - started,
+                min(budget, max_wait_seconds) if max_wait_seconds is not None else budget,
             )
         # requests' timeout bounds socket inactivity, not total response time.
         # A late response can preserve evidence but cannot qualify this drain.
-        if time.monotonic() > deadline:
+        effective_deadline = min(deadline, hard_deadline) if hard_deadline is not None else deadline
+        if now > effective_deadline:
             break
         if last_read_ok and not queue_budget_frozen:
             # Producers must already be stopped. Allow serial completion of the
             # queue observed once, keeping the original start time. Later polls
-            # never slide this deadline, even if the queue changes or stalls.
+            # never add work admitted after producer shutdown.
             budget = per_evaluation_budget * max(1, pending)
-            if max_wait_seconds is not None:
-                budget = min(budget, max_wait_seconds)
             deadline = started + budget
             queue_budget_frozen = True
         if last_read_ok and pending == 0:
             return _GradingResult(history, "complete", "drained", 0,
-                                  time.monotonic() - started, budget)
-        remaining = deadline - time.monotonic()
+                                  now - started,
+                                  min(budget, max_wait_seconds) if max_wait_seconds is not None else budget)
+        previously_queue_only = queue_only
+        effective_deadline = min(deadline, hard_deadline) if hard_deadline is not None else deadline
+        remaining = effective_deadline - now
         if remaining <= 0:
             break
         delay = min(15.0, remaining)
@@ -597,7 +625,8 @@ def _wait_for_grading(host_judge_url: str, session_token: str, admin_secret: str
     return _GradingResult(
         history, "pending" if last_read_ok and pending else "unknown",
         "deadline" if last_read_ok else "history_unavailable",
-        pending if last_read_ok else None, time.monotonic() - started, budget,
+        pending if last_read_ok else None, time.monotonic() - started,
+        min(budget, max_wait_seconds) if max_wait_seconds is not None else budget,
     )
 
 
