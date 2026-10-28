@@ -92,6 +92,9 @@ def _fixture(tmp_path: Path):
     }
     _write(root / "grading_status.json", grading)
     _write(root / "worker-profile.json", worker)
+    (root / "feedback-transport.jsonl").write_text(
+        '{"content_free":"synthetic"}\n', encoding="utf-8",
+    )
     recorder.record(
         "terminal",
         "complete",
@@ -116,6 +119,7 @@ def _fixture(tmp_path: Path):
             "grading_status.json": root / "grading_status.json",
             "run_history.json": root / "run_history.json",
             "worker-profile.json": root / "worker-profile.json",
+            "feedback-transport.jsonl": root / "feedback-transport.jsonl",
         },
     )
     policy = {
