@@ -449,6 +449,52 @@ def test_slow_response_after_deadline_remains_nonfinal(harness):
     assert harness.reads == 1
 
 
+def test_shared_queue_wait_does_not_consume_evaluation_budget(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(runner, "time", clock)
+
+    def history_reader(*_args, **_kwargs):
+        if clock.monotonic() < 1800:
+            status = "queued"
+        elif clock.monotonic() < 1860:
+            status = "running"
+        else:
+            status = "completed"
+        entries = [{"type": "submission", "status": status}]
+        return {"entries": entries}, int(status in ("queued", "running"))
+
+    result = runner._wait_for_grading(
+        "http://synthetic.invalid", "token", "admin",
+        eval_timeout=1, shutdown_event=None, logger=SimpleNamespace(warning=lambda *_: None),
+        history_reader=history_reader,
+    )
+
+    assert result.status == "complete"
+    assert result.reason == "drained"
+    assert result.elapsed_seconds >= 1860
+    assert result.wait_budget_seconds == 900
+
+
+def test_explicit_wall_clock_limit_still_bounds_shared_queue_wait(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(runner, "time", clock)
+
+    def history_reader(*_args, **_kwargs):
+        return {"entries": [{"type": "submission", "status": "queued"}]}, 1
+
+    result = runner._wait_for_grading(
+        "http://synthetic.invalid", "token", "admin",
+        eval_timeout=1200, shutdown_event=None,
+        logger=SimpleNamespace(warning=lambda *_: None),
+        max_wait_seconds=45, history_reader=history_reader,
+    )
+
+    assert result.status == "pending"
+    assert result.reason == "deadline"
+    assert result.elapsed_seconds == 45
+    assert result.wait_budget_seconds == 45
+
+
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_malformed_summary_cannot_replace_original_failure(harness, interrupted):
     harness.summary_override = {"best_score": {"invalid": True}}
