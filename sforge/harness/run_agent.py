@@ -252,11 +252,14 @@ def _install_task_file(
     )
     if result.exit_code != 0:
         raise RuntimeError(f"Cannot install task file permissions: {destination}")
-    # Test as the solver, not as the privileged installer. Scripts require read
-    # permission as well as execute permission for their interpreter to work.
+    # Test as the container's configured execution user, not as the privileged
+    # installer. Docker/Kubernetes preserve the image default; E2B stores the
+    # runner-selected ``agent`` user on the handle and resolves it from user=None.
+    # Scripts require read permission as well as execute permission for their
+    # interpreter to work.
     for permission in (["-r", "-x"] if executable else ["-r"]):
         result = backend.exec_run(
-            handle, ["test", permission, str(destination)], user="agent"
+            handle, ["test", permission, str(destination)]
         )
         if result.exit_code != 0:
             raise RuntimeError(f"Task file unavailable to solver: {destination}")

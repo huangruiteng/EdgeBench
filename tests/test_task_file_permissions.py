@@ -22,6 +22,7 @@ def test_install_failure_never_continues(failing_call, tmp_path):
         _install_task_file(backend, object(), tmp_path / "input",
                            PurePosixPath("/tmp/task-script"), executable=True)
     assert len(calls) == failing_call + 1
+    assert all(call[1].get("user") is None for call in calls[1:])
 
 
 def test_generated_files_readable_across_uids_in_real_docker(tmp_path):
