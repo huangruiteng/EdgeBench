@@ -29,8 +29,8 @@ import pytest
 from sforge.harness.agent.base import Agent
 from sforge.harness.backend.base import ContainerBackend, StreamingExecResult
 from sforge.harness.config import SForgeConfig
-from sforge.harness.task_spec import JudgeSpec, TaskSpec, WorkSpec
 from sforge.harness.runtime_attestation import verify_runtime_attestation
+from sforge.harness.task_spec import JudgeSpec, TaskSpec, WorkSpec
 
 runner = importlib.import_module("sforge.harness.run_agent")
 
@@ -171,10 +171,13 @@ def test_runner_attests_observed_boundaries_and_terminal_evaluation(harness, tmp
     harness.config.runner_source_revision = "test-source-revision"
     harness.handle.id = "container-id"
     harness.handle.name = "container-name"
+    log_dir = tmp_path / "runs" / "synthetic-run" / "cleanup-fixture"
+    log_dir.mkdir(parents=True)
+    transport = log_dir / "feedback-transport.jsonl"
+    transport.write_text('{"content_free":"synthetic"}\n')
 
     result = harness.run(submission_cooldown=1800)
 
-    log_dir = tmp_path / "runs" / "synthetic-run" / "cleanup-fixture"
     records = verify_runtime_attestation(
         log_dir / "runtime-attestation.jsonl", key,
         expected_run_id="synthetic-run", expected_task_id="cleanup-fixture",
@@ -203,6 +206,9 @@ def test_runner_attests_observed_boundaries_and_terminal_evaluation(harness, tmp
     terminal = records[-1]["payload"]["facts"]
     assert terminal["evaluation"]["status"] == "complete"
     assert terminal["outcome"]["best_score"] == result.best_score
+    assert records[-1]["payload"]["evidence"]["feedback-transport.jsonl"] == (
+        "sha256:" + hashlib.sha256(transport.read_bytes()).hexdigest()
+    )
 
 
 def test_attestation_configuration_fails_before_runtime_side_effects(harness, tmp_path):

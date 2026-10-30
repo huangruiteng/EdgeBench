@@ -63,7 +63,6 @@ from sforge.harness.restored_registration import RestoredExecution, RestoredRegi
 from sforge.harness.runtime_attestation import RuntimeAttestationRecorder
 from sforge.harness.task_spec import TaskSpec
 
-
 _CREDENTIAL_PLACEHOLDER = "sforge-host-credential"
 _USE_CONFIG_VALUE = object()
 
@@ -723,6 +722,7 @@ def _record_terminal_attestation(
         name: log_dir / name for name in (
             "solver_execution.json", "grading_status.json", "run_history.json",
             "game_history.json", "worker-profile.json", "final_archive.tar.gz",
+            "feedback-transport.jsonl",
         )
     }
     recorder.record(

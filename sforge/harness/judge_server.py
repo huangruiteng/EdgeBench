@@ -16,23 +16,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from docker.utils import parse_bytes
-
 import fcntl
 import hashlib
-import os
 import json
 import logging
+import os
 import secrets
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -40,6 +36,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import requests
+from docker.utils import parse_bytes
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
@@ -55,6 +52,7 @@ from sforge.harness.config import (
 )
 from sforge.harness.constants import get_admin_secret
 from sforge.harness.docker_build import BuildImageError, build_judge_image
+from sforge.harness.feedback_transport import FeedbackTransportRecorder
 from sforge.harness.run_evaluation import judge_submission
 from sforge.harness.selection import select_best
 from sforge.harness.task_spec import TaskSpec, load_all_tasks
@@ -646,6 +644,7 @@ class JudgeState:
             max_workers=config.judge_max_concurrent, thread_name_prefix="sforge-judge"
         )
         self.admin_secret = get_admin_secret(config.log_dir)
+        self.feedback_transport = FeedbackTransportRecorder(config.log_dir)
         self.tasks: dict[str, TaskSpec] = {}
         self.submissions: dict[str, dict] = {}  # submission_id -> {status, report, ...}
         self.game_sessions: dict[str, GameSessionState] = {}
@@ -974,6 +973,20 @@ class JudgeState:
         if not isinstance(relay_id, str) or not relay_id:
             raise KeyError("Feedback relay unavailable")
         return relay_id
+
+    def resolve_game_session(
+        self, run_id: str, task_id: str, session_id: str,
+    ) -> GameSessionState:
+        """Resolve a game route without trusting caller-supplied run identity."""
+        with self._game_lock:
+            session = self.game_sessions.get(session_id)
+            if (
+                session is None
+                or session.run_id != run_id
+                or session.task_id != task_id
+            ):
+                raise KeyError("Invalid game session")
+            return session
 
     @staticmethod
     def _agent_cooldown_wait(info: dict, now: float) -> int:
@@ -1855,35 +1868,126 @@ def create_app(
         relay_id: str, archive: UploadFile = File(...),
         include_receipt: bool = Form(False),
     ) -> SubmitResponse:
+        exchange_id = None
+        run_id = task_id = ""
         try:
-            token, _ = state.resolve_feedback_relay(relay_id)
+            token, info = state.resolve_feedback_relay(relay_id)
+            run_id, task_id = info["run_id"], info["task_id"]
+            archive_bytes = archive.file.read()
+            exchange_id = state.feedback_transport.request(
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="submit",
+                payload=archive_bytes,
+            )
             submission_id, round_id, remaining = state.submit_for_token(
-                token, archive.file.read(), "agent",
+                token, archive_bytes, "agent",
             )
-            return SubmitResponse(
-                submission_id=submission_id,
-                round_id=round_id,
-                status=SubmissionStatus.QUEUED,
-                remaining_submissions=remaining,
-                **({"receipt": submission_receipt(state.get_result(submission_id))}
-                   if include_receipt else {}),
+            payload = {
+                "submission_id": submission_id,
+                "round_id": round_id,
+                "status": SubmissionStatus.QUEUED,
+                "remaining_submissions": remaining,
+            }
+            if include_receipt:
+                payload["receipt"] = dict(
+                    submission_receipt(state.get_result(submission_id))
+                )
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="submit",
+                subject_id=submission_id,
+                payload=payload,
+                status="accepted",
             )
+            return SubmitResponse(**payload)
         except KeyError:
+            if exchange_id is not None:
+                state.feedback_transport.response(
+                    exchange_id=exchange_id,
+                    run_id=run_id,
+                    task_id=task_id,
+                    channel="active_submission",
+                    operation="submit",
+                    payload={"detail": "Feedback relay not found"},
+                    status="not_found",
+                )
             raise HTTPException(status_code=404, detail="Feedback relay not found")
-        except (SubmissionBudgetExceeded, SubmissionCooldownActive) as exc:
+        except SubmissionBudgetExceeded as exc:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="submit",
+                payload={"detail": str(exc)},
+                status="budget_exhausted",
+            )
+            raise HTTPException(status_code=429, detail=str(exc))
+        except SubmissionCooldownActive as exc:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="submit",
+                payload={"detail": str(exc)},
+                status="cooldown_active",
+            )
             raise HTTPException(status_code=429, detail=str(exc))
         except JudgeCapacityExceeded as exc:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="submit",
+                payload={"detail": str(exc)},
+                status="capacity_exceeded",
+            )
             raise HTTPException(
                 status_code=503, detail=str(exc), headers={"Retry-After": "5"},
             )
         except ValueError as exc:
+            if exchange_id is not None:
+                state.feedback_transport.response(
+                    exchange_id=exchange_id,
+                    run_id=run_id,
+                    task_id=task_id,
+                    channel="active_submission",
+                    operation="submit",
+                    payload={"detail": str(exc)},
+                    status="invalid_request",
+                )
             raise HTTPException(status_code=404, detail=str(exc))
 
     @app.get("/api/v1/feedback/{relay_id}/history")
     def feedback_history(relay_id: str) -> dict:
         try:
-            token, _ = state.resolve_feedback_relay(relay_id)
-            return state.get_agent_history(token)
+            token, info = state.resolve_feedback_relay(relay_id)
+            run_id, task_id = info["run_id"], info["task_id"]
+            exchange_id = state.feedback_transport.request(
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="history",
+                payload={},
+            )
+            payload = state.get_agent_history(token)
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="history",
+                payload=payload,
+                status="delivered",
+            )
+            return payload
         except KeyError:
             raise HTTPException(status_code=404, detail="Feedback relay not found")
 
@@ -1895,84 +1999,291 @@ def create_app(
         relay_id: str, submission_id: str,
         include_receipt: bool = Query(False),
     ) -> ResultResponse:
+        exchange_id = None
+        run_id = task_id = ""
         try:
-            token, _ = state.resolve_feedback_relay(relay_id)
+            token, info = state.resolve_feedback_relay(relay_id)
+            run_id, task_id = info["run_id"], info["task_id"]
+            exchange_id = state.feedback_transport.request(
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="result",
+                subject_id=submission_id,
+                payload={"submission_id": submission_id},
+            )
             result = state.get_result_for_token(
                 token, submission_id, agent_only=True,
             )
         except KeyError:
+            if exchange_id is not None:
+                state.feedback_transport.response(
+                    exchange_id=exchange_id,
+                    run_id=run_id,
+                    task_id=task_id,
+                    channel="active_submission",
+                    operation="result",
+                    subject_id=submission_id,
+                    payload={"detail": "Feedback relay not found"},
+                    status="not_found",
+                )
             raise HTTPException(status_code=404, detail="Feedback relay not found")
-        return result_response(
-            submission_id, result, include_receipt=include_receipt,
+        if result is None:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="active_submission",
+                operation="result",
+                subject_id=submission_id,
+                payload={"detail": "Submission not found"},
+                status="not_found",
+            )
+            raise HTTPException(status_code=404, detail="Submission not found")
+        payload = {
+            "submission_id": submission_id,
+            "status": result["status"],
+            "report": result["report"],
+            "error": result["error"],
+        }
+        if include_receipt:
+            payload["receipt"] = dict(submission_receipt(result))
+        state.feedback_transport.response(
+            exchange_id=exchange_id,
+            run_id=run_id,
+            task_id=task_id,
+            channel="active_submission",
+            operation="result",
+            subject_id=submission_id,
+            payload=payload,
+            status="delivered",
         )
+        return ResultResponse(**payload)
 
     # --- Game session routes ---
 
     @app.post("/api/v1/game/{run_id}/{task_id}/new")
     def game_new(run_id: str, task_id: str, req: GameNewRequest) -> GameNewResponse:
         """Start a new game session in a dedicated container."""
+        exchange_id = state.feedback_transport.request(
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="new",
+            payload={},
+        )
         try:
             sess, data = state.create_game_session(run_id, task_id)
         except ValueError as e:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="new",
+                payload={"detail": str(e)},
+                status="invalid_request",
+            )
             raise HTTPException(404, str(e))
         except (RuntimeError, BuildImageError) as e:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="new",
+                payload={"detail": str(e)},
+                status="unavailable",
+            )
             raise HTTPException(503, str(e))
-        return GameNewResponse(
-            session_id=sess.session_id,
-            observation=data.get("observation", ""),
-            score=data.get("score", 0),
-            peak_score=data.get("peak_score", 0),
-            max_score=data.get("max_score", 0),
-            done=data.get("done", False),
-            moves=data.get("moves", 0),
+        payload = {
+            "session_id": sess.session_id,
+            "observation": data.get("observation", ""),
+            "score": data.get("score", 0),
+            "peak_score": data.get("peak_score", 0),
+            "max_score": data.get("max_score", 0),
+            "done": data.get("done", False),
+            "moves": data.get("moves", 0),
+        }
+        state.feedback_transport.response(
+            exchange_id=exchange_id,
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="new",
+            subject_id=sess.session_id,
+            payload=payload,
+            status="delivered",
         )
+        return GameNewResponse(**payload)
 
     @app.post("/api/v1/game/{run_id}/{task_id}/{session_id}/step")
     def game_step(run_id: str, task_id: str, session_id: str, req: GameStepRequest) -> GameStepResponse:
         try:
-            data = state.game_step(session_id, req.action)
+            state.resolve_game_session(run_id, task_id, session_id)
         except KeyError:
             raise HTTPException(404, f"Game session not found: {session_id}")
-        except requests.HTTPError as e:
-            raise HTTPException(400, str(e))
-        return GameStepResponse(
-            session_id=session_id,
-            observation=data.get("observation", ""),
-            score=data.get("score", 0),
-            peak_score=data.get("peak_score", 0),
-            max_score=data.get("max_score", 0),
-            done=data.get("done", False),
-            moves=data.get("moves", 0),
+        exchange_id = state.feedback_transport.request(
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="step",
+            subject_id=session_id,
+            payload={"action": req.action},
         )
+        try:
+            data = state.game_step(session_id, req.action)
+        except KeyError:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="step",
+                subject_id=session_id,
+                payload={"detail": "Game session not found"},
+                status="not_found",
+            )
+            raise HTTPException(404, f"Game session not found: {session_id}")
+        except requests.HTTPError as e:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="step",
+                subject_id=session_id,
+                payload={"detail": str(e)},
+                status="upstream_rejected",
+            )
+            raise HTTPException(400, str(e))
+        payload = {
+            "session_id": session_id,
+            "observation": data.get("observation", ""),
+            "score": data.get("score", 0),
+            "peak_score": data.get("peak_score", 0),
+            "max_score": data.get("max_score", 0),
+            "done": data.get("done", False),
+            "moves": data.get("moves", 0),
+        }
+        state.feedback_transport.response(
+            exchange_id=exchange_id,
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="step",
+            subject_id=session_id,
+            payload=payload,
+            status="delivered",
+        )
+        return GameStepResponse(**payload)
 
     @app.get("/api/v1/game/{run_id}/{task_id}/{session_id}/status")
     def game_status(run_id: str, task_id: str, session_id: str) -> GameStatusResponse:
         try:
-            data = state.game_status(session_id)
+            state.resolve_game_session(run_id, task_id, session_id)
         except KeyError:
             raise HTTPException(404, f"Game session not found: {session_id}")
-        return GameStatusResponse(
-            session_id=session_id,
-            score=data.get("score", 0),
-            peak_score=data.get("peak_score", 0),
-            max_score=data.get("max_score", 0),
-            done=data.get("done", False),
-            moves=data.get("moves", 0),
+        exchange_id = state.feedback_transport.request(
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="status",
+            subject_id=session_id,
+            payload={},
         )
+        try:
+            data = state.game_status(session_id)
+        except KeyError:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="status",
+                subject_id=session_id,
+                payload={"detail": "Game session not found"},
+                status="not_found",
+            )
+            raise HTTPException(404, f"Game session not found: {session_id}")
+        except requests.HTTPError as e:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="status",
+                subject_id=session_id,
+                payload={"detail": str(e)},
+                status="upstream_rejected",
+            )
+            raise HTTPException(400, str(e))
+        payload = {
+            "session_id": session_id,
+            "score": data.get("score", 0),
+            "peak_score": data.get("peak_score", 0),
+            "max_score": data.get("max_score", 0),
+            "done": data.get("done", False),
+            "moves": data.get("moves", 0),
+        }
+        state.feedback_transport.response(
+            exchange_id=exchange_id,
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="status",
+            subject_id=session_id,
+            payload=payload,
+            status="delivered",
+        )
+        return GameStatusResponse(**payload)
 
     @app.post("/api/v1/game/{run_id}/{task_id}/{session_id}/close")
     def game_close(run_id: str, task_id: str, session_id: str) -> GameCloseResponse:
         try:
-            data = state.close_game_session(session_id)
+            state.resolve_game_session(run_id, task_id, session_id)
         except KeyError:
             raise HTTPException(404, f"Game session not found: {session_id}")
-        return GameCloseResponse(
-            session_id=session_id,
-            final_score=data.get("final_score", 0),
-            peak_score=data.get("peak_score", 0),
-            max_score=data.get("max_score", 0),
-            moves=data.get("moves", 0),
+        exchange_id = state.feedback_transport.request(
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="close",
+            subject_id=session_id,
+            payload={},
         )
+        try:
+            data = state.close_game_session(session_id)
+        except KeyError:
+            state.feedback_transport.response(
+                exchange_id=exchange_id,
+                run_id=run_id,
+                task_id=task_id,
+                channel="game",
+                operation="close",
+                subject_id=session_id,
+                payload={"detail": "Game session not found"},
+                status="not_found",
+            )
+            raise HTTPException(404, f"Game session not found: {session_id}")
+        payload = {
+            "session_id": session_id,
+            "final_score": data.get("final_score", 0),
+            "peak_score": data.get("peak_score", 0),
+            "max_score": data.get("max_score", 0),
+            "moves": data.get("moves", 0),
+        }
+        state.feedback_transport.response(
+            exchange_id=exchange_id,
+            run_id=run_id,
+            task_id=task_id,
+            channel="game",
+            operation="close",
+            subject_id=session_id,
+            payload=payload,
+            status="delivered",
+        )
+        return GameCloseResponse(**payload)
 
     @app.post("/api/v1/game/{run_id}/{task_id}/close-all")
     def game_close_all(run_id: str, task_id: str) -> dict:

@@ -38,6 +38,7 @@ import uvicorn
 from sforge.harness import judge_server
 from sforge.harness.config import SForgeConfig
 from sforge.harness.evolve_scripts import generate_submit_script
+from sforge.harness.feedback_transport import JOURNAL_FILE, payload_sha256
 from sforge.harness.grading import EvalDetail, EvalReport
 
 
@@ -179,6 +180,38 @@ def test_relay_is_run_scoped_and_raw_result_requires_host_token(judge):
 
     script = generate_submit_script()
     assert "SFORGE_TOKEN" not in script and "SFORGE_JUDGE_URL" not in script
+
+
+def test_relay_journals_submission_ack_and_feedback_delivery_without_content(judge):
+    submitted = judge.run()
+    assert submitted.returncode == 0, submitted.stderr
+    sid = accepted_id(judge)
+
+    path = judge.state.config.log_dir / "runs/run/example" / JOURNAL_FILE
+    raw = path.read_text()
+    assert "synthetic answer" not in raw
+    assert "synthetic result" not in raw
+    assert "public diagnostic" not in raw
+    records = [json.loads(line) for line in raw.splitlines()]
+
+    submit = [record for record in records if record["operation"] == "submit"]
+    assert [record["record_kind"] for record in submit] == ["request", "response"]
+    assert submit[1]["status"] == "accepted"
+    assert submit[1]["subject_id"] == sid
+    assert submit[0]["observed_at_unix"] <= submit[1]["observed_at_unix"]
+
+    delivered = [
+        record for record in records
+        if record["operation"] == "result" and record["record_kind"] == "response"
+    ]
+    assert delivered and delivered[-1]["status"] == "delivered"
+    result = judge.state.get_result(sid)
+    assert delivered[-1]["payload_sha256"] == payload_sha256({
+        "submission_id": sid,
+        "status": result["status"],
+        "report": result["report"],
+        "error": result["error"],
+    })
 
 
 def test_read_result_preserves_full_feedback_and_submission_opportunity(judge):
@@ -456,6 +489,16 @@ def test_json_receipt_survives_pending_reads_and_workspace_deletion(judge):
         accepted = json.loads(submitted.stdout)
         sid = accepted_id(judge)
         assert accepted["submission_id"] == sid and accepted["status"] == "queued"
+        transport = (
+            judge.state.config.log_dir / "runs/run/example" / JOURNAL_FILE
+        )
+        records = [json.loads(line) for line in transport.read_text().splitlines()]
+        submit_delivery = [
+            record for record in records
+            if record["operation"] == "submit"
+            and record["record_kind"] == "response"
+        ][-1]
+        assert submit_delivery["payload_sha256"] == payload_sha256(accepted)
         receipt = accepted["receipt"]
         assert receipt["schema_version"] == "sforge_submission_receipt_v1"
         assert receipt["task_id"] == "example" and receipt["round_id"] == "agent-1"
@@ -468,6 +511,13 @@ def test_json_receipt_survives_pending_reads_and_workspace_deletion(judge):
         assert result["status"] in ("queued", "running")
         assert result["receipt"] == receipt
         assert result["report"] is None and not judge.cache.exists()
+        records = [json.loads(line) for line in transport.read_text().splitlines()]
+        result_delivery = [
+            record for record in records
+            if record["operation"] == "result"
+            and record["record_kind"] == "response"
+        ][-1]
+        assert result_delivery["payload_sha256"] == payload_sha256(result)
     finally:
         judge.grade_release.set()
     recovered = judge.run("--json", "--result", sid, "--details")
