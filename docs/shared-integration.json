@@ -100,6 +100,30 @@
       "url": "https://github.com/huangruiteng/EdgeBench/pull/13",
       "head_sha": "47fa89e2c4db5f957f7a30ba3da29928f83d8f43",
       "owner": "huangruiteng"
+    },
+    {
+      "number": 3,
+      "url": "https://github.com/huangruiteng/EdgeBench/pull/3",
+      "head_sha": "f39241cfc407a0eee006d377e6d5bb972653426c",
+      "owner": "loopx-agent"
+    },
+    {
+      "number": 16,
+      "url": "https://github.com/huangruiteng/EdgeBench/pull/16",
+      "head_sha": "481791ed16e92a274b8f7d77874806cd1600ebb9",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 17,
+      "url": "https://github.com/huangruiteng/EdgeBench/pull/17",
+      "head_sha": "f9b7dcc0becac2ac1f72a06023c7a681d1947c64",
+      "owner": "huangruiteng"
+    },
+    {
+      "number": 33,
+      "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/33",
+      "head_sha": "f866a5222fafdce87f580bce158d525477896d26",
+      "owner": "huangruiteng"
     }
   ]
 }
