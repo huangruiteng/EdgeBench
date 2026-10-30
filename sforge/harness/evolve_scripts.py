@@ -47,6 +47,7 @@ def generate_submit_script() -> str:
       --list, -l       show submission history and current limits (no new submission)
       --result ID     poll a submission from this run's history (no new submission)
       --no-wait       return after acceptance, or read --result once without polling
+      --json          emit the native response and optional source receipt as JSON
     """
     return _generate_submit_script()
 
@@ -60,6 +61,7 @@ LIST_MODE=0
 RESULT_MODE=0
 DETAILS_MODE=0
 NO_WAIT=0
+JSON_MODE=0
 SUBMISSION_ID=""
 while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -68,6 +70,7 @@ while [ "$#" -gt 0 ]; do
         --list|-l) LIST_MODE=1 ;;
         --details|-d) DETAILS_MODE=1 ;;
         --no-wait) NO_WAIT=1 ;;
+        --json) JSON_MODE=1 ;;
         --result)
             if [ "$#" -eq 0 ] || [ -z "$1" ]; then
                 echo "ERROR: --result requires a submission ID" >&2
@@ -91,6 +94,7 @@ while [ "$#" -gt 0 ]; do
             echo "                  Combine with --details for full test details"
             echo "  --no-wait       Submit a snapshot and return its ID without waiting for grading"
             echo "                  With --result ID: query once; return pending or the final feedback"
+            echo "  --json          Emit one native JSON response; progress and errors use stderr"
             echo "  -h, --help      Show this help message"
             exit 0
             ;;
@@ -120,6 +124,11 @@ if [ "$NO_WAIT" -eq 1 ] && { [ "$LIST_MODE" -eq 1 ] || { [ "$DETAILS_MODE" -eq 1
     exit 1
 fi
 
+exec 3>&1
+if [ "$JSON_MODE" -eq 1 ]; then
+    exec 1>&2
+fi
+
 umask 077
 REQUEST_TMP=$(mktemp -d)
 trap 'rm -rf "$REQUEST_TMP"' EXIT
@@ -142,11 +151,31 @@ get_json() {
     cat "$REQUEST_TMP/response.json"
 }
 
+emit_receipt() {
+    # Verify the native response matches the accepted/visible submission before
+    # emitting it. Null archive fields explicitly mean legacy provenance unknown.
+    if ! echo "$1" | jq -e --arg sid "$SUBMISSION_ID" --arg round "$ROUND_ID" '
+        .submission_id == $sid and .receipt.schema_version == "sforge_submission_receipt_v1"
+        and .receipt.round_id == $round and (.receipt.task_id | type == "string")
+        and ((.receipt.archive_sha256 == null and .receipt.archive_bytes == null)
+          or ((.receipt.archive_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+            and (.receipt.archive_bytes | type == "number" and . >= 0 and floor == .)))
+        ' >/dev/null; then
+        echo "ERROR: Native source receipt unavailable or mismatched; do not resubmit" >&2
+        return 1
+    fi
+    echo "$1" | jq -c . >&3
+}
+
 if [ "$LIST_MODE" -eq 1 ]; then
     HIST=$(get_json "$FEEDBACK_URL/history")
     if ! echo "$HIST" | jq -e '.entries | type == "array"' >/dev/null; then
         echo "ERROR: Malformed submission history" >&2
         exit 1
+    fi
+    if [ "$JSON_MODE" -eq 1 ]; then
+        echo "$HIST" | jq -c . >&3
+        exit 0
     fi
     BEST_RATE=$(echo "$HIST" | jq -r '.best_pass_rate // 0')
     BEST_SCORE=$(echo "$HIST" | jq -r '.best_score // "N/A"')
@@ -229,7 +258,12 @@ echo ""
 
 # ── Submit + poll ──
 
+RECEIPT_ARGS=()
+if [ "$JSON_MODE" -eq 1 ]; then
+    RECEIPT_ARGS=(-F "include_receipt=true")
+fi
 if ! HTTP_CODE=$(curl -sS -o "$REQUEST_TMP/submit.json" -w '%{http_code}' -m 120 -X POST "$FEEDBACK_URL/submit" \
+    "${RECEIPT_ARGS[@]}" \
     -F "archive=@$ARCHIVE_FILE"); then
     echo "ERROR: Submission response lost; acceptance is unknown. Do not automatically resubmit." >&2
     echo "Use sforge-submit --list, then --result ID to recover an accepted result." >&2
@@ -278,6 +312,10 @@ fi
 
 echo "  Evaluation uses the submitted archive snapshot; later workspace edits do not change it."
 if [ "$NO_WAIT" -eq 1 ] && [ "$RESULT_MODE" -eq 0 ]; then
+    if [ "$JSON_MODE" -eq 1 ]; then
+        emit_receipt "$SUBMIT_RESP"
+        exit 0
+    fi
     echo "  Accepted for evaluation; no grading result has been read."
     echo "  Continue independent work, then check feedback once: sforge-submit --result $SUBMISSION_ID --no-wait --details"
     exit 0
@@ -287,7 +325,11 @@ if [ "$NO_WAIT" -eq 0 ]; then
     echo "  Waiting for test results..."
 fi
 for _ in $(seq 1 720); do
-    RESULT=$(get_json "$FEEDBACK_URL/result/$SUBMISSION_ID")
+    RESULT_URL="$FEEDBACK_URL/result/$SUBMISSION_ID"
+    if [ "$JSON_MODE" -eq 1 ]; then
+        RESULT_URL="$RESULT_URL?include_receipt=true"
+    fi
+    RESULT=$(get_json "$RESULT_URL")
     STATUS=$(echo "$RESULT" | jq -r '.status // empty')
     if [ "$STATUS" = "completed" ] || [ "$STATUS" = "error" ]; then
         break
@@ -297,6 +339,10 @@ for _ in $(seq 1 720); do
         exit 1
     fi
     if [ "$NO_WAIT" -eq 1 ]; then
+        if [ "$JSON_MODE" -eq 1 ]; then
+            emit_receipt "$RESULT"
+            exit 0
+        fi
         echo "  Pending: $SUBMISSION_ID ($STATUS); no score available yet."
         echo "  Continue independent work; check this same ID later with --result $SUBMISSION_ID --no-wait --details."
         exit 0
@@ -316,15 +362,22 @@ TS=$(date +%s)
 ERROR_MSG=$(echo "$RESULT" | jq -r '.error // empty')
 
 if [ "$STATUS" = "error" ]; then
+    if [ "$JSON_MODE" -eq 1 ]; then emit_receipt "$RESULT"; fi
     echo "ERROR: $SUBMISSION_ID evaluation failed: ${ERROR_MSG:-no diagnostic returned}" >&2
     exit 1
 fi
 if ! echo "$RESULT" | jq -e '.report | type == "object"' >/dev/null; then
+    if [ "$JSON_MODE" -eq 1 ]; then emit_receipt "$RESULT"; fi
     echo "ERROR: $SUBMISSION_ID completed without a report; no score available" >&2
     exit 1
 fi
 
 REPORT=$(echo "$RESULT" | jq -r '.report')
+if [ "$JSON_MODE" -eq 1 ]; then
+    # A machine read does not depend on, or update, the human display cache.
+    emit_receipt "$RESULT"
+    exit 0
+fi
 PASSED=$(echo "$REPORT" | jq -r '.passed // 0')
 TOTAL=$(echo "$REPORT" | jq -r '.total_tests // 0')
 FAILED=$(echo "$REPORT" | jq -r '.failed // 0')

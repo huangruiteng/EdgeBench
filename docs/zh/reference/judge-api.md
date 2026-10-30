@@ -116,6 +116,42 @@ kind: agent
 
 提交异步处理——服务器立即返回 `status: "queued"`。通过 result 接口轮询结果。
 
+### 可选来源回执与 JSON 客户端输出
+
+`sforge-submit --json` 在 stdout 输出一份原生 JSON 响应，进度和错误写入
+stderr。加 `--no-wait` 时只返回已受理提交，不读取评分；
+`--result ID --no-wait --json` 只读一次同一提交，普通
+`--result ID --json` 等待完成。JSON 保留完整公开报告，包括 details、零分、
+负分、缺失分数及 `valid=false`。未完成时 report 为空；评分错误保留 error，
+退出码非零。JSON 模式不读取或更新供人查看的本地缓存；省略 `--json` 保持
+原有文本及缓存行为。`--list --json` 仅返回当前 relay 可见的历史和准入快照。
+
+客户端在 submit 表单或 result 查询中传入 `include_receipt=true`。result
+回执通过不透明、绑定 run 的反馈 relay 查询，work 容器既拿不到 judge URL，也
+拿不到 judge token；直接调用宿主 API 查询回执时仍需 session token。两条链路
+都只能读取当前注册可见的 agent 历史，不公开其他运行或宿主自动评测。未开启
+时 API 响应字段保持原样。开启后，两种响应均包含：
+
+```json
+{
+  "receipt": {
+    "schema_version": "sforge_submission_receipt_v1",
+    "task_id": "example",
+    "round_id": "agent-1",
+    "archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "archive_bytes": 1234
+  }
+}
+```
+
+摘要由 judge 在异步评分前对实际受理的归档字节计算；工作区修改、删除或响应
+丢失后的读回仍关联外层同一 `submission_id`，不会重新提交、补发预算或重置
+冷却。checkpoint 捕获和恢复会保留每个回执，并重映射查询 ID。旧结果缺少来源
+时，归档字段明确为 null。旧服务器不支持回执时，无法提供 `--json` 来源回执；
+应使用原文本客户端恢复，不能因此重提。上面的摘要只是示例。归档摘要不等于
+源码树摘要、题目输入版本或评测器身份；比较仍须由 runner 独立验证这些条件。
+回执匹配不证明实验可比、分数有效或候选最优。
+
 ### 获取结果
 
 轮询提交的评测结果。

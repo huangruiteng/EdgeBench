@@ -20,6 +20,7 @@ from collections.abc import Callable
 from docker.utils import parse_bytes
 
 import fcntl
+import hashlib
 import os
 import json
 import logging
@@ -36,7 +37,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -85,11 +86,20 @@ class SubmissionStatus(str, Enum):
     ERROR = "error"
 
 
+class SubmissionReceipt(BaseModel):
+    schema_version: Literal["sforge_submission_receipt_v1"] = "sforge_submission_receipt_v1"
+    task_id: str
+    round_id: str | None
+    archive_sha256: str | None
+    archive_bytes: int | None
+
+
 class ResultResponse(BaseModel):
     submission_id: str
     status: SubmissionStatus
     report: dict | None = None
     error: str | None = None
+    receipt: SubmissionReceipt | None = None
 
 
 class GameNewRequest(BaseModel):
@@ -165,6 +175,7 @@ class SubmitResponse(BaseModel):
     round_id: str
     status: SubmissionStatus
     remaining_submissions: int | None = None
+    receipt: SubmissionReceipt | None = None
 
 
 # --- Game session state ---
@@ -1177,7 +1188,8 @@ class JudgeState:
                 finally:
                     self._release(run_id, task_id)
                 raise
-            submission_id = self._enqueue(task_id, spool, run_id, round_id, cpu, mem)
+            submission_id = self._enqueue(task_id, spool, run_id, round_id, cpu, mem,
+                                          hashlib.sha256(archive).hexdigest(), len(archive))
             return submission_id, round_id, remaining
 
     def submit(self, task_id: str, archive: bytes, run_id: str | None = None, round: str | None = None,
@@ -1192,7 +1204,8 @@ class JudgeState:
             except BaseException:
                 self._release(run_id, task_id)
                 raise
-            return self._enqueue(task_id, spool, run_id, round, judge_cpu_limit, judge_mem_limit)
+            return self._enqueue(task_id, spool, run_id, round, judge_cpu_limit, judge_mem_limit,
+                                 hashlib.sha256(archive).hexdigest(), len(archive))
 
     def _spool(self, archive: bytes) -> Path:
         # Queued snapshots must not accumulate in RAM. Retain the spool after a
@@ -1209,12 +1222,14 @@ class JudgeState:
         return path
 
     def _enqueue(self, task_id: str, spool: Path, run_id: str | None,
-                 round_id: str | None, cpu: int | None, mem: str | None) -> str:
+                 round_id: str | None, cpu: int | None, mem: str | None,
+                 archive_sha256: str, archive_bytes: int) -> str:
         submission_id = uuid.uuid4().hex[:12]
         self.submissions[submission_id] = {
             "status": SubmissionStatus.QUEUED, "task_id": task_id,
             "run_id": run_id, "round": round_id, "report": None, "error": None,
             "submitted_at": time.time(),
+            "archive_sha256": archive_sha256, "archive_bytes": archive_bytes,
         }
         try:
             self._record_submission(run_id or submission_id, submission_id, task_id,
@@ -1706,7 +1721,19 @@ def create_app(
         from sforge.harness.checkpoint import install_routes
         install_routes(app, state)
 
-    def result_response(submission_id: str, result: dict | None) -> ResultResponse:
+    def submission_receipt(result: dict) -> SubmissionReceipt:
+        # A restored legacy result may lack provenance. Never hash the current
+        # workspace or infer an archive from the result's round/lookup ID.
+        return SubmissionReceipt(
+            schema_version="sforge_submission_receipt_v1",
+            task_id=result["task_id"], round_id=result["round"],
+            archive_sha256=result.get("archive_sha256"),
+            archive_bytes=result.get("archive_bytes"),
+        )
+
+    def result_response(
+        submission_id: str, result: dict | None, *, include_receipt: bool = False,
+    ) -> ResultResponse:
         if result is None:
             raise HTTPException(status_code=404, detail="Submission not found")
         return ResultResponse(
@@ -1714,20 +1741,26 @@ def create_app(
             status=result["status"],
             report=result["report"],
             error=result["error"],
+            **({"receipt": submission_receipt(result)} if include_receipt else {}),
         )
 
-    @app.get("/api/v1/result/{submission_id}")
+    @app.get("/api/v1/result/{submission_id}", response_model_exclude_unset=True)
     def get_result(
         submission_id: str, token: str | None = Query(None),
+        include_receipt: bool = Query(False),
     ) -> ResultResponse:
         """Host API: get a result only within the token's registered run."""
         if not token:
             raise HTTPException(status_code=401, detail="Token required")
         try:
-            result = state.get_result_for_token(token, submission_id)
+            result = state.get_result_for_token(
+                token, submission_id, agent_only=include_receipt,
+            )
         except KeyError:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return result_response(submission_id, result)
+        return result_response(
+            submission_id, result, include_receipt=include_receipt,
+        )
 
     @app.post("/api/v1/register")
     def register(req: RegisterRequest) -> RegisterResponse:
@@ -1757,12 +1790,13 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
-    @app.post("/api/v1/submit")
+    @app.post("/api/v1/submit", response_model_exclude_unset=True)
     def submit(
         token: str = Form(...),
         archive: UploadFile = File(...),
         kind: str = Form("agent"),
         admin_secret: str = Form(""),
+        include_receipt: bool = Form(False),
     ) -> SubmitResponse:
         """Submit an archive using a session token.
 
@@ -1780,6 +1814,8 @@ def create_app(
             return SubmitResponse(
                 submission_id=submission_id, round_id=round_id,
                 status=SubmissionStatus.QUEUED, remaining_submissions=remaining,
+                **({"receipt": submission_receipt(state.get_result(submission_id))}
+                   if include_receipt else {}),
             )
         except KeyError:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -1817,6 +1853,7 @@ def create_app(
     @app.post("/api/v1/feedback/{relay_id}/submit")
     def feedback_submit(
         relay_id: str, archive: UploadFile = File(...),
+        include_receipt: bool = Form(False),
     ) -> SubmitResponse:
         try:
             token, _ = state.resolve_feedback_relay(relay_id)
@@ -1828,6 +1865,8 @@ def create_app(
                 round_id=round_id,
                 status=SubmissionStatus.QUEUED,
                 remaining_submissions=remaining,
+                **({"receipt": submission_receipt(state.get_result(submission_id))}
+                   if include_receipt else {}),
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="Feedback relay not found")
@@ -1848,8 +1887,14 @@ def create_app(
         except KeyError:
             raise HTTPException(status_code=404, detail="Feedback relay not found")
 
-    @app.get("/api/v1/feedback/{relay_id}/result/{submission_id}")
-    def feedback_result(relay_id: str, submission_id: str) -> ResultResponse:
+    @app.get(
+        "/api/v1/feedback/{relay_id}/result/{submission_id}",
+        response_model_exclude_unset=True,
+    )
+    def feedback_result(
+        relay_id: str, submission_id: str,
+        include_receipt: bool = Query(False),
+    ) -> ResultResponse:
         try:
             token, _ = state.resolve_feedback_relay(relay_id)
             result = state.get_result_for_token(
@@ -1857,7 +1902,9 @@ def create_app(
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="Feedback relay not found")
-        return result_response(submission_id, result)
+        return result_response(
+            submission_id, result, include_receipt=include_receipt,
+        )
 
     # --- Game session routes ---
 

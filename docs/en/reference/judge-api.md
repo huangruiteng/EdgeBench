@@ -129,6 +129,51 @@ kind: agent
 
 Submissions are processed asynchronously --- the server returns immediately with `status: "queued"`. Poll the result endpoint to check progress.
 
+### Optional source receipts and JSON client output
+
+`sforge-submit --json` emits one native JSON response on stdout; progress and
+errors use stderr. Add `--no-wait` to return the accepted submission without
+reading grading, or use `--result ID --no-wait --json` for a single read of that
+same submission. A normal `--result ID --json` waits for completion. JSON reads
+preserve the full public report, including details, zero/negative scores,
+missing scores and `valid=false`. Pending responses have no report; grading
+errors retain their error and exit nonzero. JSON mode neither reads nor updates
+the human display cache. Omit `--json` for the existing text/cache behavior.
+`--list --json` returns only the current relay's visible history/availability
+snapshot.
+
+The client requests `include_receipt=true` as a submit form field or result
+query parameter through the opaque, run-scoped feedback relay. The work
+container receives neither the judge URL nor a judge token. Direct host API
+receipt queries still require a session token. Both routes are limited to the
+registration's visible agent history; other runs and host-only automatic
+submissions are not exposed. Without this option, the API response fields
+remain unchanged. Both opt-in responses include:
+
+```json
+{
+  "receipt": {
+    "schema_version": "sforge_submission_receipt_v1",
+    "task_id": "example",
+    "round_id": "agent-1",
+    "archive_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "archive_bytes": 1234
+  }
+}
+```
+
+The digest is computed by the judge from the exact accepted archive bytes,
+before asynchronous grading. It stays associated with the outer `submission_id`
+after workspace edits/deletion or a lost-response recovery; reads never submit
+again or replenish budget/cooldown. Checkpoint capture/restore preserves each
+receipt while remapping lookup IDs. Older retained results have explicit null
+archive fields. A server without receipt support cannot provide `--json`
+source receipts; recover with the existing text client instead of resubmitting.
+The example digest above is illustrative. An archive digest is not a source-tree
+digest, task-input revision or evaluator identity. Comparisons still need those
+independently verified conditions from their runner; a matching receipt is not
+proof of a comparable experiment, valid score or best candidate.
+
 ### Get Result
 
 Poll for the result of a submission.

@@ -350,6 +350,11 @@ class JudgeCheckpoints:
                 results[entry["submission_id"]] = {
                     key: result[key] for key in ("status", "report", "error")
                 }
+                # Preserve optional accepted-archive identity across remapped
+                # lookup IDs, without inventing it for older capsules.
+                for key in ("archive_sha256", "archive_bytes"):
+                    if key in result:
+                        results[entry["submission_id"]][key] = result[key]
             observed = time.time()
             last, cooldown = info["last_agent_submit_at"], info["submission_cooldown"]
             selected = self._selection(task_id, history)
