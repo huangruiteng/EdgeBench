@@ -23,14 +23,17 @@ import os
 import threading
 import time
 import uuid
-from unittest.mock import MagicMock, ANY
 from types import SimpleNamespace
+from unittest.mock import ANY, MagicMock
 
 import docker
-
 import pytest
 
-from sforge.harness.backend.docker_backend import DockerBackend
+from sforge.harness.backend.docker_backend import (
+    DOCKER_CLEANUP_REQUEST_TIMEOUT,
+    DockerBackend,
+    DockerContainerHandle,
+)
 
 
 def test_container_init_defaults_on():
@@ -279,3 +282,66 @@ def test_docker_reconciliation_tolerates_concurrent_container_deletion_races():
         "123:concurrent-submission", "docker:synthetic-engine"
     )
     assert containers.responses == []
+
+
+def test_cleanup_control_requests_use_bounded_deadlines():
+    class Api:
+        def __init__(self):
+            self.calls = []
+
+        def _url(self, template, container_id):
+            return template.format(container_id)
+
+        def _post(self, url, **kwargs):
+            self.calls.append(("post", url, kwargs))
+            return object()
+
+        def _delete(self, url, **kwargs):
+            self.calls.append(("delete", url, kwargs))
+            return object()
+
+        def _raise_for_status(self, _response):
+            return None
+
+    api = Api()
+    client = SimpleNamespace(api=api)
+    container = SimpleNamespace(id="exact-container", name="fixture")
+
+    DockerBackend(client).cleanup_container(DockerContainerHandle(container))
+
+    assert api.calls == [
+        ("post", "/containers/exact-container/stop", {
+            "params": {"t": 15}, "timeout": DOCKER_CLEANUP_REQUEST_TIMEOUT,
+        }),
+        ("delete", "/containers/exact-container", {
+            "params": {"v": False, "link": False, "force": True},
+            "timeout": DOCKER_CLEANUP_REQUEST_TIMEOUT,
+        }),
+    ]
+
+
+def test_docker_reconciliation_releases_dead_removing_runtime():
+    class Container:
+        def __init__(self):
+            self.id = "metadata-only"
+            self.name = "synthetic.judge.synthetic.finished-submission"
+            self.attrs = {"State": {
+                "Status": "removing", "Running": False, "Paused": False,
+                "Restarting": False, "Dead": True, "Pid": 0,
+            }}
+
+        def stop(self, **_kwargs):
+            raise AssertionError("dead runtime must not be stopped again")
+
+        def remove(self, **_kwargs):
+            raise AssertionError("metadata deletion must not hold runtime capacity")
+
+    container = Container()
+    containers = SimpleNamespace(list=lambda **_kwargs: [container])
+    client = SimpleNamespace(
+        info=lambda: {"ID": "synthetic-engine"}, containers=containers,
+    )
+
+    assert DockerBackend(client).reconcile_judge_capacity_holder(
+        "123:finished-submission", "docker:synthetic-engine"
+    )
