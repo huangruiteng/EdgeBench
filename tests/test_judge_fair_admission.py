@@ -44,6 +44,48 @@ def test_later_poll_cannot_barge_ahead_of_older_waiter(tmp_path):
     second.release("later")
 
 
+def test_foreground_feedback_bypasses_background_but_keeps_class_fifo(tmp_path):
+    path = str(tmp_path / "slots.json")
+    slots = js.HostJudgeCapacity(1, path)
+    assert slots.try_acquire("holder")
+    assert not slots.try_acquire("background-1")
+    assert not slots.try_acquire("background-2")
+    assert not slots.try_acquire("feedback-1", priority=1)
+    assert not slots.try_acquire("feedback-2", priority=1)
+
+    slots.release("holder")
+    assert not slots.try_acquire("feedback-2", priority=1)
+    assert slots.try_acquire("feedback-1", priority=1)
+    slots.release("feedback-1")
+    assert slots.try_acquire("feedback-2", priority=1)
+    slots.release("feedback-2")
+    assert not slots.try_acquire("background-2")
+    assert slots.try_acquire("background-1")
+    slots.release("background-1")
+    assert slots.try_acquire("background-2")
+    slots.release("background-2")
+
+
+def test_foreground_bypass_is_bounded_for_background_progress(tmp_path):
+    path = str(tmp_path / "slots.json")
+    slots = js.HostJudgeCapacity(1, path)
+    assert slots.try_acquire("holder")
+    assert not slots.try_acquire("background")
+    feedback = [f"feedback-{index}" for index in range(5)]
+    for token in feedback:
+        assert not slots.try_acquire(token, priority=1)
+
+    slots.release("holder")
+    for token in feedback[:js.JUDGE_FOREGROUND_BYPASS_BURST]:
+        assert slots.try_acquire(token, priority=1)
+        slots.release(token)
+    assert not slots.try_acquire(feedback[-1], priority=1)
+    assert slots.try_acquire("background")
+    slots.release("background")
+    assert slots.try_acquire(feedback[-1], priority=1)
+    slots.release(feedback[-1])
+
+
 def test_memory_and_slot_admission_share_order_without_partial_reservation(tmp_path):
     slots = js.HostJudgeCapacity(2, str(tmp_path / "slots.json"))
     memory = js.HostJudgeCapacity(4, str(tmp_path / "memory.json"))
@@ -213,6 +255,58 @@ def test_cancelled_native_worker_removes_waiter_and_keeps_pool_usable(
         state.close()
         state._reaper_stop.set()
         state._reaper_thread.join(5)
+
+
+def test_submission_kind_selects_host_capacity_priority(tmp_path, monkeypatch):
+    monkeypatch.setenv("SFORGE_JUDGE_HOST_SLOT_FILE", str(tmp_path / "slots.json"))
+    monkeypatch.setenv("SFORGE_JUDGE_HOST_OWNER_FILE", str(tmp_path / "owners.json"))
+    priorities = []
+    backend = SimpleNamespace(
+        backend_name="docker",
+        judge_capacity_owner_id=lambda: "docker:synthetic",
+        reconcile_judge_capacity_holder=lambda *_: True,
+    )
+    state = js.JudgeState(
+        SForgeConfig(
+            log_dir=tmp_path,
+            judge_host_capacity=1,
+            judge_max_concurrent=1,
+            judge_max_pending=0,
+        ),
+        backend_factory=lambda _: backend,
+    )
+    state.tasks = {"t": SimpleNamespace(
+        judge=SimpleNamespace(
+            mem_limit="1g", selection="pass_rate_first", score_direction="maximize",
+        )
+    )}
+    monkeypatch.setattr(
+        state.host_capacity,
+        "try_acquire",
+        lambda *_args, **kwargs: priorities.append(kwargs["priority"]) or True,
+    )
+    monkeypatch.setattr(
+        js,
+        "judge_submission",
+        lambda **_: SimpleNamespace(to_dict=lambda: {"valid": True, "score": 1}),
+    )
+    token = state.register_session("t", "run")
+
+    def submit_and_wait(kind):
+        submission_id = state.submit_for_token(token, b"archive", kind)[0]
+        deadline = time.monotonic() + 5
+        while state.get_result(submission_id)["status"] not in ("completed", "error"):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        state._executor.submit(lambda: None).result(timeout=5)
+        assert state.get_result(submission_id)["status"] == "completed"
+
+    try:
+        submit_and_wait("auto")
+        submit_and_wait("agent")
+        assert priorities == [0, 1]
+    finally:
+        state.close()
 
 
 def _contend_for_slot(path, index, ready, release):

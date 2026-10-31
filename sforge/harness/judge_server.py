@@ -248,6 +248,10 @@ JUDGE_HOST_CAPACITY = 8
 #: startup reconciliation.  Capacity waiters periodically retry backend-confirmed
 #: cleanup so an orphan cannot stall every later judge indefinitely.
 JUDGE_CAPACITY_RECONCILE_INTERVAL = 5.0
+# Solver-requested feedback can bypass older background evaluations, but only in
+# bounded bursts. This keeps the interactive path responsive without starving
+# periodic score history when a client submits continuously.
+JUDGE_FOREGROUND_BYPASS_BURST = 4
 
 
 class HostJudgeCapacity:
@@ -360,6 +364,8 @@ class HostJudgeCapacity:
                 or w["units"] < 1
                 or type(w.get("memory_units")) is not int
                 or w["memory_units"] < 0
+                or type(w.get("priority", 0)) is not int
+                or w.get("priority", 0) < 0
                 or (
                     w.get("memory_path") is not None
                     and not isinstance(w["memory_path"], str)
@@ -385,18 +391,23 @@ class HostJudgeCapacity:
         units: int = 1,
         memory_capacity: HostJudgeCapacity | None = None,
         memory_units: int = 0,
+        priority: int = 0,
     ) -> bool:
-        """Admit in FIFO order only when every requested resource fits.
+        """Admit by bounded priority and FIFO when every resource fits.
 
-        Waiters reserve no capacity. Queue order survives polling and process-local
-        object recreation. A dead waiter can be removed without backend cleanup;
-        holders still require explicit release or confirmed container cleanup.
-        All launchers sharing these files must use fair admission for FIFO service.
+        Higher-priority requests can bypass older lower-priority requests, while a
+        persisted burst counter admits the oldest waiter after a bounded number of
+        bypasses. FIFO order is preserved within a priority class. Waiters reserve
+        no capacity. Queue state survives polling and process-local object
+        recreation. A dead waiter can be removed without backend cleanup; holders
+        still require explicit release or confirmed container cleanup.
         """
         if type(units) is not int or units < 1:
             raise ValueError("Judge host capacity units must be a positive integer")
         if type(memory_units) is not int or memory_units < 0:
             raise ValueError("Judge memory units must be a nonnegative integer")
+        if type(priority) is not int or priority < 0:
+            raise ValueError("Judge request priority must be a nonnegative integer")
         if (memory_capacity is None) != (memory_units == 0):
             raise ValueError(
                 "Judge memory capacity and positive units must be supplied together"
@@ -462,10 +473,12 @@ class HostJudgeCapacity:
                 else None,
                 "memory_units": memory_units,
                 "process_start": self._process_start(token),
+                "priority": priority,
             }
             prior = next((w for w in live if w["token"] == token), None)
             if prior is not None and any(
-                prior[k] != request[k] for k in request if k != "process_start"
+                prior.get(k, 0 if k == "priority" else None) != request[k]
+                for k in request if k != "process_start"
             ):
                 raise RuntimeError(
                     "Judge host waiter identity mismatch; cancel before changing request"
@@ -481,7 +494,24 @@ class HostJudgeCapacity:
                 <= st["capacity"]
                 for capacity, required, st, _, current in snapshots
             )
-            if not already_held and (live[0]["token"] != token or not fits):
+            oldest = live[0] if live else None
+            candidate = oldest
+            priority_burst = state.get("priority_burst", 0)
+            if type(priority_burst) is not int or priority_burst < 0:
+                raise RuntimeError(
+                    "Invalid judge host priority state; explicit recovery required"
+                )
+            if live:
+                highest = max(w.get("priority", 0) for w in live)
+                preferred = next(
+                    w for w in live if w.get("priority", 0) == highest
+                )
+                if (
+                    preferred is not oldest
+                    and priority_burst < JUDGE_FOREGROUND_BYPASS_BURST
+                ):
+                    candidate = preferred
+            if not already_held and (candidate["token"] != token or not fits):
                 if live != waiters:
                     self._write(state)
                 return False
@@ -493,6 +523,9 @@ class HostJudgeCapacity:
             # backend-confirmed cleanup; ordinary write failures roll back here.
             try:
                 state["waiters"] = [w for w in live if w["token"] != token]
+                state["priority_burst"] = (
+                    priority_burst + 1 if candidate is not oldest else 0
+                )
                 for capacity, required, st, owners, current in reversed(snapshots):
                     if current is None:
                         st["holders"][token] = (
@@ -1201,8 +1234,10 @@ class JudgeState:
                 finally:
                     self._release(run_id, task_id)
                 raise
-            submission_id = self._enqueue(task_id, spool, run_id, round_id, cpu, mem,
-                                          hashlib.sha256(archive).hexdigest(), len(archive))
+            submission_id = self._enqueue(
+                task_id, spool, run_id, round_id, cpu, mem,
+                hashlib.sha256(archive).hexdigest(), len(archive), kind=kind,
+            )
             return submission_id, round_id, remaining
 
     def submit(self, task_id: str, archive: bytes, run_id: str | None = None, round: str | None = None,
@@ -1236,7 +1271,8 @@ class JudgeState:
 
     def _enqueue(self, task_id: str, spool: Path, run_id: str | None,
                  round_id: str | None, cpu: int | None, mem: str | None,
-                 archive_sha256: str, archive_bytes: int) -> str:
+                 archive_sha256: str, archive_bytes: int,
+                 *, kind: str | None = None) -> str:
         submission_id = uuid.uuid4().hex[:12]
         self.submissions[submission_id] = {
             "status": SubmissionStatus.QUEUED, "task_id": task_id,
@@ -1248,7 +1284,7 @@ class JudgeState:
             self._record_submission(run_id or submission_id, submission_id, task_id,
                                     round_id, None, None, status="queued")
             self._executor.submit(self._grade_spooled, submission_id, task_id,
-                                  spool, run_id, round_id, cpu, mem)
+                                  spool, run_id, round_id, cpu, mem, kind)
         except BaseException as e:
             self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
             try:
@@ -1264,7 +1300,8 @@ class JudgeState:
 
     def _grade_spooled(self, submission_id: str, task_id: str, spool: Path,
                        run_id: str | None, round_id: str | None,
-                       cpu: int | None, mem: str | None) -> None:
+                       cpu: int | None, mem: str | None,
+                       kind: str | None = None) -> None:
         backend = self._get_backend(run_id, task_id)
         token = f"{os.getpid()}:{submission_id}"
         slot_acquired = memory_acquired = False
@@ -1289,6 +1326,7 @@ class JudgeState:
                     slot_acquired = self.host_capacity.try_acquire(
                         token, owner_id, memory_capacity=self.host_memory_capacity,
                         memory_units=memory_units or 0,
+                        priority=1 if kind == "agent" else 0,
                     )
                     if slot_acquired:
                         memory_acquired = self.host_memory_capacity is not None
