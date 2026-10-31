@@ -103,6 +103,20 @@ def test_simultaneous_tokens_kinds_and_direct_calls_share_key(make_judge, monkey
     assert state.get_result(sid)["report"]["source_sha256"] == hashlib.sha256(b"source").hexdigest()
 
 
+def test_run_history_counts_game_rounds_as_agent_submissions(make_judge):
+    state = make_judge()
+    state.run_history["run/test"] = [
+        {"type": "game", "round": "game-1", "score": 3},
+        {"type": "game", "round": "game-2", "score": 7},
+    ]
+
+    history = state.get_run_history("run", "test")
+
+    assert history["agent_submissions"] == 2
+    assert history["auto_submissions"] == 0
+    assert len(history["entries"]) == 2
+
+
 def test_limit_above_one_and_aggregate_rejection_do_not_leak(make_judge, monkeypatch):
     state = make_judge(judge_max_outstanding_per_run=2, judge_max_pending=1)
     release = threading.Event()
