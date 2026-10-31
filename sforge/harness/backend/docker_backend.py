@@ -46,6 +46,9 @@ from sforge.harness.backend.base import (
 HEREDOC_DELIMITER = "EOF_SFORGE_1399519320"
 RECONCILE_DELETE_POLL_SECONDS = 0.05
 RECONCILE_DELETE_POLL_ATTEMPTS = 20
+DOCKER_CLEANUP_REQUEST_TIMEOUT = float(
+    os.environ.get("SFORGE_DOCKER_CLEANUP_REQUEST_TIMEOUT", "30")
+)
 
 
 def _container_disappearance_race(error: Exception) -> bool:
@@ -55,6 +58,24 @@ def _container_disappearance_race(error: Exception) -> bool:
     status = getattr(getattr(error, "response", None), "status_code", None)
     detail = str(error).lower()
     return status == 409 and "removal" in detail and "already in progress" in detail
+
+
+def _container_runtime_released(container) -> bool:
+    """Return whether a retained Docker record owns no CPU/memory runtime.
+
+    Docker can leave a dead container in ``removing`` while an overlay or network
+    cleanup request is still pending.  Host Judge capacity protects running CPU
+    and memory, so that metadata-only state must not hold a slot indefinitely.
+    """
+    attrs = getattr(container, "attrs", None) or {}
+    state = attrs.get("State") or {}
+    return (
+        state.get("Status") in {"dead", "exited", "removing"}
+        and state.get("Running") is False
+        and state.get("Paused") is False
+        and state.get("Restarting") is False
+        and state.get("Pid") == 0
+    )
 
 
 # A create request whose outcome we cannot know: the POST may have reached the
@@ -221,6 +242,45 @@ class DockerBackend(ContainerBackend):
         return self._client
 
     # --- Lifecycle ---
+
+    def _stop_container_for_cleanup(self, container: Container, timeout: int) -> None:
+        """Stop with a control-plane deadline independent of task timeouts."""
+        api = getattr(self._client, "api", None)
+        if not all(callable(getattr(api, name, None)) for name in
+                   ("_url", "_post", "_raise_for_status")):
+            container.stop(timeout=timeout)
+            return
+        response = api._post(
+            api._url("/containers/{0}/stop", container.id),
+            params={"t": timeout}, timeout=DOCKER_CLEANUP_REQUEST_TIMEOUT,
+        )
+        api._raise_for_status(response)
+
+    def _remove_container_for_cleanup(self, container: Container) -> None:
+        """Remove with a bounded daemon response wait."""
+        api = getattr(self._client, "api", None)
+        if not all(callable(getattr(api, name, None)) for name in
+                   ("_url", "_delete", "_raise_for_status")):
+            container.remove(force=True)
+            return
+        response = api._delete(
+            api._url("/containers/{0}", container.id),
+            params={"v": False, "link": False, "force": True},
+            timeout=DOCKER_CLEANUP_REQUEST_TIMEOUT,
+        )
+        api._raise_for_status(response)
+
+    def _inspect_container_for_cleanup(self, container: Container) -> dict:
+        """Inspect without inheriting the task-scale Docker client timeout."""
+        api = getattr(self._client, "api", None)
+        if not all(callable(getattr(api, name, None)) for name in
+                   ("_url", "_get", "_result")):
+            return self._client.api.inspect_container(container.id)
+        response = api._get(
+            api._url("/containers/{0}/json", container.id),
+            timeout=DOCKER_CLEANUP_REQUEST_TIMEOUT,
+        )
+        return api._result(response, True)
 
     def create_container(
         self,
@@ -405,7 +465,7 @@ class DockerBackend(ContainerBackend):
         container_disappeared = False
         try:
             log_info(f"Stopping container {container.name}...")
-            container.stop(timeout=15)
+            self._stop_container_for_cleanup(container, timeout=15)
         except Exception as e:
             if _container_disappearance_race(e):
                 log_info(f"Container {container.name} is already being removed.")
@@ -413,7 +473,7 @@ class DockerBackend(ContainerBackend):
             else:
                 log_error(f"Failed to stop container {container.name}: {e}")
                 try:
-                    container_info = self._client.api.inspect_container(container.id)
+                    container_info = self._inspect_container_for_cleanup(container)
                     pid = container_info["State"].get("Pid", 0)
                     if pid > 0:
                         log_info(f"Forcefully killing container PID {pid}...")
@@ -424,7 +484,7 @@ class DockerBackend(ContainerBackend):
         if not container_disappeared:
             try:
                 log_info(f"Removing container {container.name}...")
-                container.remove(force=True)
+                self._remove_container_for_cleanup(container)
                 log_info(f"Container {container.name} removed.")
             except Exception as e:
                 if _container_disappearance_race(e):
@@ -485,6 +545,8 @@ class DockerBackend(ContainerBackend):
         # launcher owns neither a process nor a Docker resource. Keeping that
         # legacy row forever would permanently reduce the shared judge budget.
         for container in owned:
+            if _container_runtime_released(container):
+                continue
             self.cleanup_container(
                 DockerContainerHandle(container), logging.getLogger(__name__)
             )
@@ -492,6 +554,7 @@ class DockerBackend(ContainerBackend):
             remaining = self._list_containers_during_reconciliation(submission_id)
             if not any(
                 ".judge." in container.name and container.name.endswith(suffix)
+                and not _container_runtime_released(container)
                 for container in remaining
             ):
                 return True
