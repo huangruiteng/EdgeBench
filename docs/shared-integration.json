@@ -124,6 +124,12 @@
       "url": "https://github.com/ByteDance-Seed/EdgeBench/pull/33",
       "head_sha": "f866a5222fafdce87f580bce158d525477896d26",
       "owner": "huangruiteng"
+    },
+    {
+      "number": 18,
+      "url": "https://github.com/huangruiteng/EdgeBench/pull/18",
+      "head_sha": "9ef5bc828d27ff29a1b6e615d01a403744d0d615",
+      "owner": "huangruiteng"
     }
   ]
 }
