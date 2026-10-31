@@ -1125,12 +1125,24 @@ class JudgeState:
         best = select_best(entries, direction, policy)
 
         sub_entries = [e for e in entries if e.get("type") == "submission"]
+        game_entries = [e for e in entries if e.get("type") == "game"]
         return {
             "run_id": run_id,
             "best_score": best["best_score"],
             "best_pass_rate": best["best_pass_rate"],
             "best_round": best["best_round"],
-            "agent_submissions": sum(1 for e in sub_entries if (e.get("round") or "").startswith("agent-")),
+            # Game rounds are initiated by the agent through the game API.  The
+            # runner therefore reports every archived game as an agent
+            # submission; keep the authoritative history summary on the same
+            # accounting basis so terminal integrity checks can compare them.
+            "agent_submissions": (
+                len(game_entries)
+                + sum(
+                    1
+                    for e in sub_entries
+                    if (e.get("round") or "").startswith("agent-")
+                )
+            ),
             "auto_submissions": sum(1 for e in sub_entries if (e.get("round") or "").startswith("auto-")),
             "entries": entries,
         }
