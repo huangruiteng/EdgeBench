@@ -1764,9 +1764,9 @@ class JudgeState:
             for sid, sess in sessions:
                 self.game_sessions.pop(sid, None)
                 sess.operation_lock.acquire()
+        failures = []
         try:
             if backend.backend_name == "e2b":
-                failures = []
                 for sid, sess in sessions:
                     try:
                         backend.cleanup_container(sess.container, logger)
@@ -1774,13 +1774,11 @@ class JudgeState:
                         logger.exception(
                             "Error cleaning up game container for session %s", sid,
                         )
-                        failures.append((sid, exc))
-                        with self._game_lock:
-                            self.game_sessions.setdefault(sid, sess)
+                        failures.append((sid, sess, exc))
                         continue
                     self._archive_game_session(sess)
                 if failures:
-                    detail = ", ".join(f"{sid}: {exc}" for sid, exc in failures)
+                    detail = ", ".join(f"{sid}: {exc}" for sid, _, exc in failures)
                     raise RuntimeError(f"Failed to clean up game containers: {detail}")
                 return len(sessions)
 
@@ -1802,6 +1800,12 @@ class JudgeState:
             for _, sess in sessions:
                 if sess.operation_lock.locked():
                     sess.operation_lock.release()
+            if failures:
+                # A reader waits for operation_lock while holding _game_lock.
+                # Publish retries only after every owned operation lock is free.
+                with self._game_lock:
+                    for sid, sess, _ in failures:
+                        self.game_sessions.setdefault(sid, sess)
 
 
 
