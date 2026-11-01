@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import secrets
 import tempfile
@@ -82,6 +83,31 @@ class SubmissionStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     ERROR = "error"
+
+
+def json_safe_feedback_payload(value: Any) -> Any:
+    """Project non-finite scores into explicit standard-JSON string markers.
+
+    Judge parsers may legitimately return infinity for an invalid optimization
+    candidate. Keep those raw numbers in server state so selection and final
+    score reconciliation retain their original semantics. HTTP responses and
+    signed feedback transport records must be standard JSON, though, and the
+    default FastAPI encoder rejects non-finite floats with a 500 response.
+
+    Strings distinguish a non-finite score from ``null`` (missing). Finite
+    values and container shape remain unchanged.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        return {key: json_safe_feedback_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe_feedback_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe_feedback_payload(item) for item in value]
+    return value
 
 
 class SubmissionReceipt(BaseModel):
@@ -1802,7 +1828,7 @@ def create_app(
         return ResultResponse(
             submission_id=submission_id,
             status=result["status"],
-            report=result["report"],
+            report=json_safe_feedback_payload(result["report"]),
             error=result["error"],
             **({"receipt": submission_receipt(result)} if include_receipt else {}),
         )
@@ -1905,9 +1931,9 @@ def create_app(
             raise HTTPException(status_code=401, detail="Invalid token")
         full = state.get_run_history(info["run_id"], info["task_id"])
         if admin_secret == state.admin_secret:
-            return full
+            return json_safe_feedback_payload(full)
         try:
-            return state.get_agent_history(token)
+            return json_safe_feedback_payload(state.get_agent_history(token))
         except KeyError:
             raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -2027,7 +2053,7 @@ def create_app(
                 operation="history",
                 payload={},
             )
-            payload = state.get_agent_history(token)
+            payload = json_safe_feedback_payload(state.get_agent_history(token))
             state.feedback_transport.response(
                 exchange_id=exchange_id,
                 run_id=run_id,
@@ -2090,12 +2116,12 @@ def create_app(
                 status="not_found",
             )
             raise HTTPException(status_code=404, detail="Submission not found")
-        payload = {
+        payload = json_safe_feedback_payload({
             "submission_id": submission_id,
             "status": result["status"],
             "report": result["report"],
             "error": result["error"],
-        }
+        })
         if include_receipt:
             payload["receipt"] = dict(submission_receipt(result))
         state.feedback_transport.response(
