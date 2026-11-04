@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in real Docker regressions; only use an already available test image."""
+"""Opt-in Docker regressions; use a cached image with bash, Python and procps."""
 
 import os
 import threading
+import time
 
 import docker
 import pytest
@@ -29,7 +30,7 @@ from sforge.harness.backend.docker_backend import DockerBackend, DockerContainer
 def container():
     image = os.environ.get("SFORGE_DOCKER_TEST_IMAGE")
     if not image:
-        pytest.skip("set SFORGE_DOCKER_TEST_IMAGE to a cached bash/python3 image")
+        pytest.skip("set SFORGE_DOCKER_TEST_IMAGE to a cached bash/python3/procps image")
     client = docker.from_env()
     client.images.get(image)  # Never pull an image from this test.
     owned = client.containers.run(
@@ -42,7 +43,10 @@ def container():
     try:
         yield owned
     finally:
-        owned.remove(force=True)
+        try:
+            owned.remove(force=True)
+        except docker.errors.NotFound:
+            pass  # A disappearance regression may have removed this exact ID.
         assert not client.containers.list(all=True, filters={"id": owned.id})
         client.close()
 
@@ -583,3 +587,281 @@ def test_receipt_publication_failure_is_nonzero(container, execute, monkeypatch)
         container.exec_run(["bash", "-c", 'compgen -G "/dev/shm/sforge-exec-*"']).exit_code
         == 1
     )
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+@pytest.mark.parametrize('user', [None, '65534'])
+def test_snapshot_pause_across_stop_preserves_terminal_and_drained_output(
+    container, execute, tmp_path, monkeypatch, cancel, user
+):
+    ready = threading.Event()
+    stop_attempt = threading.Event()
+    stop = threading.Event()
+    failures = []
+    paused_errors = []
+    real_control = container.exec_run
+
+    def record_control(command, **kwargs):
+        is_stop = command[2] == ': > "$1/stop"'
+        if is_stop:
+            stop_attempt.set()
+        try:
+            return real_control(command, **kwargs)
+        except docker.errors.APIError as exc:
+            if is_stop:
+                paused_errors.append(exc.status_code)
+            raise
+
+    def snapshot():
+        try:
+            assert ready.wait(5)
+            container.pause()
+            if cancel:
+                stop.set()
+            assert stop_attempt.wait(5)
+            time.sleep(.3)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            container.reload()
+            if container.attrs['State']['Paused']:
+                container.unpause()  # Only the snapshot owner resumes it.
+
+    monkeypatch.setattr(container, 'exec_run', record_control)
+    observer = threading.Thread(target=snapshot)
+    observer.start()
+    body = '''import signal,time,sys
+signal.signal(signal.SIGTERM, lambda *_: (print('FINAL',flush=True),sys.exit(0)))
+print('READY',flush=True)
+time.sleep(60)
+'''
+    log = tmp_path / 'paused.log'
+    try:
+        result = execute(
+            ['python3', '-u', '-c', body], timeout=2,
+            user=user, shutdown_event=stop, log_file=log,
+            on_chunk=lambda chunk: ready.set() if b'READY' in chunk else None,
+        )
+    finally:
+        observer.join(8)
+    assert not observer.is_alive() and not failures
+    assert 409 in paused_errors  # Real daemon rejection, not a mocked timeout.
+    assert result[1:3] == (-1, True)
+    assert 'FINAL' in result[0]
+    assert log.read_bytes() == result[0].encode()
+    assert execute(['printf', 'NEXT'], timeout=5, user=user)[:3] == ('NEXT', 0, False)
+
+
+def test_never_resumed_pause_is_bounded_and_not_terminal(container, monkeypatch):
+    monkeypatch.setattr(docker_utils, '_EXEC_PAUSE_RECOVERY_GRACE', .3)
+    stop = threading.Event()
+    terminal = []
+
+    def freeze(chunk):
+        if b'READY' in chunk:
+            container.pause()
+            stop.set()
+
+    began = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match='pause recovery expired'):
+            docker_utils._exec_run(
+                container, ['bash', '-c', 'echo READY; sleep 60'], timeout=5,
+                shutdown_event=stop, on_chunk=freeze, on_terminal=terminal.append,
+            )
+        assert time.monotonic() - began < 3
+        assert not terminal
+        container.reload()
+        assert container.attrs['State']['Paused']  # Never unpaused by the runner.
+    finally:
+        container.unpause()
+
+
+@pytest.mark.parametrize('paused', [False, True])
+def test_unrelated_conflict_is_preserved_without_pause_recovery(
+    container, monkeypatch, paused
+):
+    stop = threading.Event()
+    terminal = []
+    response = requests.Response()
+    response.status_code = 409
+    original = docker.errors.APIError('conflict', response=response, explanation='unrelated conflict')
+    control = container.exec_run
+    attempts = []
+
+    def conflict(command, **kwargs):
+        if command[2] == ': > "$1/stop"':
+            attempts.append(time.monotonic())
+            raise original
+        return control(command, **kwargs)
+
+    def ready(chunk):
+        if b'READY' in chunk:
+            if paused:
+                container.pause()
+            stop.set()
+
+    monkeypatch.setattr(container, 'exec_run', conflict)
+    try:
+        with pytest.raises(docker.errors.APIError) as raised:
+            docker_utils._exec_run(
+                container, ['bash', '-c', 'echo READY; sleep 60'], timeout=5,
+                shutdown_event=stop, on_chunk=ready, on_terminal=terminal.append,
+            )
+        assert raised.value is original
+        assert len(attempts) == 2  # Original call and existing best-effort cleanup.
+        assert attempts[-1] - attempts[0] < .5
+        assert not terminal
+    finally:
+        if paused:
+            container.unpause()
+
+
+def test_restarted_container_is_not_adopted_during_pause_recovery(container, monkeypatch):
+    stop = threading.Event()
+    terminal = []
+    control = container.exec_run
+    restarted = False
+
+    def restart_before_stop(command, **kwargs):
+        nonlocal restarted
+        if command[2] == ': > "$1/stop"' and not restarted:
+            restarted = True
+            container.restart(timeout=0)
+            container.pause()
+        return control(command, **kwargs)
+
+    monkeypatch.setattr(container, 'exec_run', restart_before_stop)
+    try:
+        with pytest.raises(RuntimeError, match='incarnation changed'):
+            docker_utils._exec_run(
+                container, ['bash', '-c', 'echo READY; sleep 60'], timeout=5,
+                shutdown_event=stop,
+                on_chunk=lambda chunk: stop.set() if b'READY' in chunk else None,
+                on_terminal=terminal.append,
+            )
+        assert restarted and not terminal
+    finally:
+        container.unpause()
+
+
+def test_normal_terminal_receipt_read_survives_snapshot_pause(container, execute, monkeypatch):
+    control = container.exec_run
+    resume = None
+    pauses = []
+
+    def pause_before_receipt(command, **kwargs):
+        nonlocal resume
+        if command[2] == 'cat -- "$1/settled"' and not pauses:
+            container.pause()
+            pauses.append(True)
+            resume = threading.Timer(.3, container.unpause)
+            resume.start()
+        return control(command, **kwargs)
+
+    monkeypatch.setattr(container, 'exec_run', pause_before_receipt)
+    try:
+        result = execute(['bash', '-c', 'echo DONE; exit 17'], timeout=5)
+        assert pauses and result[:3] == ('DONE\n', 17, False)
+    finally:
+        if resume:
+            resume.join(3)
+
+
+def test_missing_container_does_not_produce_terminal_receipt(container, monkeypatch):
+    stop = threading.Event()
+    terminal = []
+    control = container.exec_run
+    removed = False
+
+    def remove_before_stop(command, **kwargs):
+        nonlocal removed
+        if command[2] == ': > "$1/stop"' and not removed:
+            removed = True
+            container.remove(force=True)
+        return control(command, **kwargs)
+
+    monkeypatch.setattr(container, 'exec_run', remove_before_stop)
+    with pytest.raises(docker.errors.NotFound):
+        docker_utils._exec_run(
+            container, ['bash', '-c', 'echo READY; sleep 60'], timeout=5,
+            shutdown_event=stop,
+            on_chunk=lambda chunk: stop.set() if b'READY' in chunk else None,
+            on_terminal=terminal.append,
+        )
+    assert removed and not terminal
+
+
+def test_pause_during_group_shutdown_does_not_consume_drain_grace(
+    container, execute, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(docker_utils, '_EXEC_SHUTDOWN_GRACE', 1)
+    monkeypatch.setattr(docker_utils, '_EXEC_DRAIN_GRACE', 1)
+    stop = threading.Event()
+    resumes = []
+
+    def on_chunk(chunk):
+        if b'READY' in chunk:
+            stop.set()
+        if b'STOPPING' in chunk:
+            container.pause()
+            resume = threading.Timer(2.5, container.unpause)
+            resumes.append(resume)
+            resume.start()
+
+    body = '''import signal,time,sys
+def stop(*_):
+    print('STOPPING',flush=True)
+    time.sleep(.4)
+    print('FINAL',flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGTERM,stop)
+print('READY',flush=True)
+time.sleep(60)
+'''
+    log = tmp_path / 'drain.log'
+    try:
+        result = execute(
+            ['python3', '-u', '-c', body], timeout=5,
+            shutdown_event=stop, on_chunk=on_chunk, log_file=log,
+        )
+        assert resumes and result[1:3] == (-1, True)
+        # The in-container grace is wall-clock based and may escalate on resume;
+        # every emitted byte must still be drained, whether FINAL was emitted.
+        assert 'STOPPING' in result[0]
+        assert log.read_bytes() == result[0].encode()
+    finally:
+        for resume in resumes:
+            resume.join(5)
+
+
+def test_repeated_pause_rejections_share_one_recovery_deadline(container, monkeypatch):
+    monkeypatch.setattr(docker_utils, '_EXEC_PAUSE_RECOVERY_GRACE', .2)
+    stop = threading.Event()
+    terminal = []
+    response = requests.Response()
+    response.status_code = 409
+    conflict = docker.errors.APIError(
+        'pause race', response=response,
+        explanation=f'Container {container.id} is paused, unpause the container before exec',
+    )
+    control = container.exec_run
+    attempts = []
+
+    def reject_stop(command, **kwargs):
+        if command[2] == ': > "$1/stop"':
+            attempts.append(time.monotonic())
+            # Model a snapshot that resumes just before each fresh inspect.
+            raise conflict
+        return control(command, **kwargs)
+
+    monkeypatch.setattr(container, 'exec_run', reject_stop)
+    with pytest.raises(RuntimeError, match='pause recovery expired'):
+        docker_utils._exec_run(
+            container, ['bash', '-c', 'echo READY; sleep 60'], timeout=5,
+            shutdown_event=stop,
+            on_chunk=lambda chunk: stop.set() if b'READY' in chunk else None,
+            on_terminal=terminal.append,
+        )
+    assert len(attempts) > 2 and not terminal
+    assert .2 <= attempts[-1] - attempts[0] < .7
