@@ -350,3 +350,45 @@ def test_limit_environment_and_actual_cli_config_readback(make_judge, monkeypatc
                                 capture_output=True, text=True, timeout=10)
         assert result.returncode != 0
         assert "judge_max_outstanding_per_run must be >= 1 or unset" in result.stderr
+
+
+def test_slow_arm_cannot_delay_or_consume_peer_evaluator(make_judge, monkeypatch):
+    state = make_judge(judge_isolated_runs=("a", "b"), judge_max_concurrent=2,
+                       judge_max_pending=2, judge_max_outstanding_per_run=None)
+    entered, release, peer_done = (threading.Event() for _ in range(3))
+    order = []
+    def grade(**kw):
+        archive = kw["archive"]
+        order.append(archive)
+        if archive == b"a1":
+            entered.set()
+            assert release.wait(10)
+        if archive == b"b1":
+            peer_done.set()
+        return report(**kw)
+    monkeypatch.setattr(js, "judge_submission", grade)
+    a, b = (state.register_session("test", run) for run in ("a", "b"))
+    with pytest.raises(ValueError, match="no reserved evaluator"):
+        state.register_session("test", "unregistered")
+    try:
+        first = state.submit_for_token(a, b"a1", "agent")[0]
+        assert entered.wait(5)
+        second = state.submit_for_token(a, b"a2", "agent")[0]
+        with pytest.raises(js.JudgeCapacityExceeded):
+            state.submit_for_token(a, b"a3", "agent")
+        assert state.resolve_token(a)["next_agent"] == 3
+        other = state.submit_for_token(b, b"b1", "agent")[0]
+        assert peer_done.wait(5)
+        assert order == [b"a1", b"b1"]
+    finally:
+        release.set()
+    state.close()
+    assert order == [b"a1", b"b1", b"a2"]
+    for sid in (first, second, other):
+        assert state.get_result(sid)["status"] == js.SubmissionStatus.COMPLETED
+
+
+@pytest.mark.parametrize("runs,capacity", [(("a", "a"), 2), (("a", "b"), 1), (("",), 2)])
+def test_invalid_reserved_evaluators_are_rejected(make_judge, runs, capacity):
+    with pytest.raises(ValueError):
+        make_judge(judge_isolated_runs=runs, judge_max_concurrent=capacity)

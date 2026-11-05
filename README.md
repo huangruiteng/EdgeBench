@@ -247,3 +247,13 @@ If you find EdgeBench useful in your research, please cite our tech report:
   <br>
   <sub>Built by <a href="https://github.com/ByteDance-Seed">ByteDance Seed</a></sub>
 </p>
+
+For a matched ablation, reserve an independent evaluator for each arm by giving
+each run ID to the native judge at startup. For example, add
+`--judge-isolated-run control --judge-isolated-run treatment --judge-max-concurrent 2`
+to `sforge serve`. Each listed run has one FIFO evaluator, with an equal share of
+`--judge-max-pending` (rounded down). A saturated run receives the existing
+capacity response before consuming another round or starting its cooldown.
+Provision CPU, memory and host evaluation slots for all arms at once. A shared
+physical host can still introduce contention. Omitting the run list retains
+the usual shared judge. Record any mid-study change to evaluation scheduling.

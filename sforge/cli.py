@@ -84,7 +84,7 @@ def _make_config(args) -> SForgeConfig:
     overrides = {}
     for key in ("log_dir", "tasks_dir", "registry", "backend",
                  "work_cpu_limit", "work_mem_limit", "judge_cpu_limit", "judge_mem_limit",
-                 "judge_max_concurrent", "judge_max_pending", "judge_max_outstanding_per_run"):
+                 "judge_max_concurrent", "judge_max_pending", "judge_max_outstanding_per_run", "judge_isolated_runs"):
         val = getattr(args, key, None)
         if val is not None:
             overrides[key] = val
@@ -1110,6 +1110,8 @@ def main():
     p_serve = subparsers.add_parser("serve", help="Start judge HTTP server")
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=8080)
+    p_serve.add_argument("--judge-isolated-run", action="append", dest="judge_isolated_runs", metavar="RUN_ID",
+                         help="Reserve one FIFO evaluator for this run. Repeat for each arm; preallocate enough host capacity.")
     p_serve.add_argument("--judge-max-concurrent", type=int, default=None, help="Maximum active evaluations per server (default: 2)")
     p_serve.add_argument("--judge-max-pending", type=int, default=None, help="Maximum additional queued snapshots (default: 32)")
     p_serve.add_argument("--judge-max-outstanding-per-run", type=int, default=None,
