@@ -60,4 +60,5 @@ Evaluation tasks typically run for tens of minutes or even hours. SForge uses se
 
 - **Stop Hook**: intercepts the agent's exit requests and prevents it from quitting before time runs out. When the agent decides the "task is done," the stop hook tells it to keep checking and improving.
 - **Auto-Resume**: when the agent crashes due to API disconnects, transient errors, or other abnormal exits, the harness automatically re-launches it using the agent's native session resume mechanism (e.g., `claude --continue`) and passes the remaining timeout budget to the resumed session.
+  Both initial and resumed agent shells start with a soft core-dump limit of zero. For debugging, a tool can raise its own soft limit up to the inherited hard limit and write its dump outside the submission paths.
 - **Kubernetes backend**: enables large-scale parallel runs, evaluating multiple tasks or agents simultaneously.
