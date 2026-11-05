@@ -233,6 +233,30 @@ def test_install_consuming_budget_cannot_start_model(entry):
     assert e.backend.cleanup_container.called
 
 
+def test_restored_proxy_keeps_original_cutoff_through_install_and_work(entry, monkeypatch):
+    e = entry
+    proxy = Mock()
+    prepare = Mock(return_value=(proxy, None))
+    monkeypatch.setattr(runner, "_prepare_credential_proxy", prepare)
+    e.backend.get_container_ip.return_value = "192.0.2.7"
+
+    def install(*args, **kwargs):
+        assert prepare.call_args.kwargs["deadline_monotonic"] == 1100
+        e.clock[0] += 35
+        return SimpleNamespace(output="installed", exit_code=0, timed_out=False, elapsed_seconds=35)
+
+    e.backend.exec_run_with_exit_code.side_effect = install
+    e.backend.exec_run_with_timeout.return_value = SimpleNamespace(
+        output="{}", elapsed_seconds=2, timed_out=True,
+    )
+    event = threading.Event()
+    e.run(shutdown_event=event)
+    assert prepare.call_args.kwargs["shutdown_event"] is event
+    proxy.set_deadline.assert_called_once_with(1100)
+    assert proxy.close_admission.called
+    proxy.stop.assert_called_once()
+
+
 def test_retry_before_work_keeps_deadline_and_is_exclusive(tmp_path):
     spec = RestoredRegistration(
         "a" * 32, "b" * 64, time.time() + 100, tmp_path / "manifest.json"

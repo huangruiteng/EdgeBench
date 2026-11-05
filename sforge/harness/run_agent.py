@@ -184,6 +184,9 @@ def _prepare_credential_proxy(
     agent: Agent,
     config: SForgeConfig,
     backend: ContainerBackend,
+    *,
+    deadline_monotonic: float | None = None,
+    shutdown_event: threading.Event | None = None,
 ):
     """Prepare a Docker-hosted credential gateway when the protocol is known."""
     if backend.backend_name != "docker" or not config.agent_api_key:
@@ -207,6 +210,8 @@ def _prepare_credential_proxy(
         host="0.0.0.0",
         injected_headers=headers,
         rate_limit_retry_seconds=config.agent_rate_limit_retry_seconds,
+        deadline_monotonic=deadline_monotonic,
+        shutdown_event=shutdown_event,
     )
     return proxy, f"http://host.docker.internal:{proxy.port}"
 
@@ -1026,6 +1031,10 @@ def run_agent(
 
         credential_proxy, credential_proxy_url = _prepare_credential_proxy(
             agent, config, backend,
+            deadline_monotonic=(
+                restored_execution.monotonic_deadline if restored_execution else None
+            ),
+            shutdown_event=shutdown_event,
         )
         if credential_proxy is not None:
             env = _build_agent_env(
@@ -1297,6 +1306,14 @@ def run_agent(
         MAX_RESUMES = 100
 
         started_at = time.time()
+        if credential_proxy is not None:
+            # A cold run's inference budget starts with solving. A restored run
+            # already carries its original cutoff, including installation time.
+            # Resume gaps and paused containers never replenish this deadline.
+            credential_proxy.set_deadline(
+                restored_execution.monotonic_deadline if restored_execution
+                else time.monotonic() + effective_timeout
+            )
         from datetime import datetime
         started_at_iso = datetime.fromtimestamp(started_at).strftime("%Y-%m-%dT%H:%M:%S")
         (log_dir / "started_at").write_text(f"{started_at_iso}\n{started_at}\n")
@@ -1400,6 +1417,8 @@ def run_agent(
             resume_count += 1
             logger.info(f"Agent exited after {seg_result.elapsed_seconds:.1f}s, will resume")
 
+        if credential_proxy is not None:
+            credential_proxy.close_admission()
         agent_output = "\n".join(all_output_parts)
         runtime = total_runtime
         logger.info(
@@ -1555,6 +1574,8 @@ def run_agent(
         return result
 
     except KeyboardInterrupt:
+        if credential_proxy is not None:
+            credential_proxy.close_admission()
         logger.info("Run interrupted by user (Ctrl+C)")
 
         # Stop auto-eval thread
@@ -1619,6 +1640,8 @@ def run_agent(
         _record_terminal_attestation(runtime_attestation, log_dir, result)
         return result
     except Exception as e:
+        if credential_proxy is not None:
+            credential_proxy.close_admission()
         logger.error(f"Error: {e}\n{traceback.format_exc()}")
         grading = _GradingResult(None, "unknown", "harness_error")
         history = {}
@@ -1664,6 +1687,8 @@ def run_agent(
         _record_terminal_attestation(runtime_attestation, log_dir, result)
         return result
     finally:
+        if credential_proxy is not None:
+            credential_proxy.close_admission()
         if auto_eval_stop is not None:
             auto_eval_stop.set()
             if auto_eval_started and not auto_eval_joined:
