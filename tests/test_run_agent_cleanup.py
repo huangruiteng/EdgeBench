@@ -20,6 +20,8 @@ import hashlib
 import importlib
 import os
 import signal
+import threading
+import time
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock
@@ -120,6 +122,8 @@ def test_docker_provider_credential_stays_in_host_gateway(harness, monkeypatch, 
             self.started = False
             self.stopped = False
             self.allowed_ips = None
+            self.deadline = None
+            self.admission_closed = False
             proxies.append(self)
 
         def restrict_clients(self, allowed_ips):
@@ -131,6 +135,12 @@ def test_docker_provider_credential_stays_in_host_gateway(harness, monkeypatch, 
         def stop(self):
             self.stopped = True
 
+        def set_deadline(self, deadline):
+            self.deadline = deadline
+
+        def close_admission(self):
+            self.admission_closed = True
+
     monkeypatch.setattr("sforge.harness.api_proxy.APIProxy", FakeProxy)
     harness.config.agent_api_key = provider_secret
     harness.config.agent_api_base_url = "https://provider.example/v1"
@@ -140,12 +150,20 @@ def test_docker_provider_credential_stays_in_host_gateway(harness, monkeypatch, 
     })
     harness.backend.get_container_ip.return_value = "192.0.2.7"
 
-    result = harness.run()
+    shutdown = threading.Event()
+    before = time.monotonic()
+    def extract(*args):
+        assert proxies[0].admission_closed
+        return b"synthetic-archive"
+    harness.archive.side_effect = extract
+    result = harness.run(shutdown_event=shutdown)
 
     assert result.agent_output == "solver-output"
     assert len(proxies) == 1
     proxy = proxies[0]
     assert proxy.started and proxy.stopped
+    assert before + 5 <= proxy.deadline <= time.monotonic() + 5
+    assert proxy.kwargs["shutdown_event"] is shutdown
     assert proxy.allowed_ips == {"192.0.2.7"}
     assert proxy.kwargs["target_url"] == "https://provider.example/v1"
     assert proxy.kwargs["injected_headers"] == {

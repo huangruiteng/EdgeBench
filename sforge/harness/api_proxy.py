@@ -49,6 +49,58 @@ logger = logging.getLogger(__name__)
 _STREAM_READ_SIZE = 64 * 1024
 
 
+class _AdmissionClosed(Exception):
+    pass
+
+
+class _RequestAdmission:
+    """Linearize local admission and close, without locking over network IO.
+
+    An admitted call is in flight even if the thread is then descheduled. This
+    is not a guarantee about provider arrival time or inference cancellation.
+    """
+
+    def __init__(self, stopped, deadline_monotonic=None, shutdown_event=None):
+        self.lock = threading.Lock()
+        self.stopped = stopped
+        self.shutdown_event = shutdown_event
+        self.deadline = None
+        self.sequence = 0
+        if deadline_monotonic is not None:
+            self.set_deadline(deadline_monotonic)
+
+    def set_deadline(self, deadline):
+        if type(deadline) not in (int, float) or not math.isfinite(deadline):
+            raise ValueError("Inference deadline must be a finite monotonic timestamp")
+        with self.lock:
+            self.deadline = deadline if self.deadline is None else min(self.deadline, deadline)
+
+    def _check(self, now):
+        if self.stopped.is_set() or (
+            self.shutdown_event is not None and self.shutdown_event.is_set()
+        ):
+            raise _AdmissionClosed("proxy_stopped")
+        if self.deadline is not None and now >= self.deadline:
+            raise _AdmissionClosed("deadline_exceeded")
+
+    def remaining(self):
+        with self.lock:
+            now = time.monotonic()
+            self._check(now)
+            return math.inf if self.deadline is None else self.deadline - now
+
+    def admit(self):
+        with self.lock:
+            now = time.monotonic()
+            self._check(now)
+            self.sequence += 1
+            return self.sequence, now, self.deadline
+
+    def close(self):
+        with self.lock:
+            self.stopped.set()
+
+
 def _rate_limit_delay(value: str | None, attempt: int) -> float:
     """Respect Retry-After (seconds or HTTP date); jitter only the fallback."""
     if value:
@@ -64,10 +116,14 @@ def _rate_limit_delay(value: str | None, attempt: int) -> float:
     return min(60.0, 5.0 * 2 ** min(attempt - 1, 4)) * random.uniform(0.8, 1.0)
 
 
-def _wait_for_retry(connection: socket.socket, stopped: threading.Event, delay: float) -> bool:
+def _wait_for_retry(
+    connection: socket.socket, stopped: threading.Event, delay: float,
+    admission: _RequestAdmission | None = None,
+) -> bool:
     """A cancelled client or stopped trial must not start another paid request."""
     until = time.monotonic() + delay
     while not stopped.is_set():
+        budget = admission.remaining() if admission is not None else math.inf
         try:
             readable, _, _ = select.select([connection], [], [], 0)
             if readable and not connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
@@ -77,7 +133,7 @@ def _wait_for_retry(connection: socket.socket, stopped: threading.Event, delay: 
         remaining = until - time.monotonic()
         if remaining <= 0:
             return True
-        stopped.wait(min(remaining, 0.25))
+        stopped.wait(min(remaining, budget, 0.25))
     return False
 
 
@@ -94,6 +150,7 @@ def _make_handler(
     client_policy: dict[str, set[str] | None] | None = None,
     rate_limit_retry_seconds: int = 0,
     stopped: threading.Event | None = None,
+    admission: _RequestAdmission | None = None,
 ):
     """Create a request handler class that proxies to target_url via session."""
     target_base = target_url.rstrip("/")
@@ -101,6 +158,7 @@ def _make_handler(
     replaced_header_names = {key.lower() for key in host_headers}
     policy = client_policy if client_policy is not None else {"allowed_ips": None}
     stop_event = stopped if stopped is not None else threading.Event()
+    admission = admission if admission is not None else _RequestAdmission(stop_event)
 
     class ProxyHandler(BaseHTTPRequestHandler):
         # HTTP/1.0: connection close signals end-of-body, no need for
@@ -123,12 +181,6 @@ def _make_handler(
                 return
             upstream_url = f"{target_base}{self.path}"
 
-            body = None
-            content_length = self.headers.get("Content-Length")
-            if content_length:
-                body = self.rfile.read(int(content_length))
-                body_size = len(body)
-
             fwd_headers = {}
             for key, val in self.headers.items():
                 if key.lower() in (
@@ -144,8 +196,21 @@ def _make_handler(
             fwd_headers.update(host_headers)
 
             response_started = False
+            resp = None
             try:
+                admission.remaining()
+                body = None
+                content_length = self.headers.get("Content-Length")
+                if content_length:
+                    body = self.rfile.read(int(content_length))
+                    body_size = len(body)
                 while True:
+                    dispatch_id, admitted_at, deadline = admission.admit()
+                    logger.info(
+                        "api-proxy dispatch_admitted id=%d method=%s path=%s "
+                        "admitted_at_monotonic=%.6f deadline_monotonic=%s",
+                        dispatch_id, self.command, request_path, admitted_at, deadline,
+                    )
                     resp = session.request(
                         method=self.command,
                         url=upstream_url,
@@ -153,55 +218,72 @@ def _make_handler(
                         data=body,
                         timeout=300,
                         stream=True,
+                        # Automatic redirects dispatch inside requests, beyond
+                        # this admission boundary. Budgeted callers must use the
+                        # final endpoint; return redirects to them unchanged.
+                        allow_redirects=deadline is None and admission.shutdown_event is None,
                     )
                     if resp.status_code != 429 or not rate_limit_retry_seconds:
                         break
                     delay = _rate_limit_delay(resp.headers.get("Retry-After"), rate_limit_retries + 1)
-                    remaining = rate_limit_retry_seconds - (time.monotonic() - started_at)
+                    try:
+                        remaining = min(
+                            rate_limit_retry_seconds - (time.monotonic() - started_at),
+                            admission.remaining(),
+                        )
+                    except _AdmissionClosed:
+                        break  # An admitted late response is still provider evidence.
                     if delay >= remaining:
                         break  # Preserve the last 429 and its original headers/body.
                     logger.info(
                         "api-proxy rate_limit_retry=%d delay_seconds=%.3f observed_at_epoch=%.3f",
                         rate_limit_retries + 1, delay, time.time(),
                     )
-                    if not _wait_for_retry(self.connection, stop_event, delay):
-                        resp.close()
+                    if not _wait_for_retry(self.connection, stop_event, delay, admission):
+                        admission.remaining()
                         terminal_reason = "retry_cancelled"
                         return
                     if time.monotonic() - started_at >= rate_limit_retry_seconds:
                         break  # A delayed wake must preserve this response too.
                     resp.close()
+                    resp = None
                     rate_limit_retries += 1
-                with resp:
-                    status = resp.status_code
-                    content_type = resp.headers.get("Content-Type")
-                    self.send_response(resp.status_code)
-                    for key, val in resp.headers.items():
-                        if key.lower() in (
-                            "transfer-encoding",
-                            "content-encoding",
-                            "content-length",
-                            "connection",
-                            "keep-alive",
-                        ):
-                            continue
-                        self.send_header(key, val)
-                    self.end_headers()
-                    response_started = True
-                    # ``iter_content(chunk_size=None)`` asks urllib3 to read
-                    # until EOF.  Provider SSE responses can remain open for
-                    # minutes, so that mode withholds every event from the
-                    # agent.  ``read1`` returns currently available decoded
-                    # bytes without waiting to fill the requested buffer.
-                    while chunk := resp.raw.read1(
-                        _STREAM_READ_SIZE, decode_content=True
+                status = resp.status_code
+                content_type = resp.headers.get("Content-Type")
+                self.send_response(resp.status_code)
+                for key, val in resp.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-encoding",
+                        "content-length",
+                        "connection",
+                        "keep-alive",
                     ):
-                        if first_byte_at is None:
-                            first_byte_at = time.monotonic()
-                        chunk_count += 1
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    terminal_reason = "upstream_eof"
+                        continue
+                    self.send_header(key, val)
+                self.end_headers()
+                response_started = True
+                # ``iter_content(chunk_size=None)`` asks urllib3 to read
+                # until EOF.  Provider SSE responses can remain open for
+                # minutes, so that mode withholds every event from the
+                # agent.  ``read1`` returns currently available decoded
+                # bytes without waiting to fill the requested buffer.
+                while chunk := resp.raw.read1(
+                    _STREAM_READ_SIZE, decode_content=True
+                ):
+                    if first_byte_at is None:
+                        first_byte_at = time.monotonic()
+                    chunk_count += 1
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                terminal_reason = "upstream_eof"
+            except _AdmissionClosed as exc:
+                terminal_reason = str(exc)
+                status = 503
+                try:
+                    self.send_error(503, "Inference admission closed")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             except (BrokenPipeError, ConnectionResetError):
                 # A solver timeout or cancellation can close a streaming model
                 # response normally. The response socket is already unusable;
@@ -220,6 +302,8 @@ def _make_handler(
                         terminal_reason = "client_disconnect"
                         logger.debug("api-proxy client disconnected before error response")
             finally:
+                if resp is not None:
+                    resp.close()
                 ttfb_ms = (
                     round((first_byte_at - started_at) * 1000)
                     if first_byte_at is not None
@@ -255,7 +339,16 @@ def _make_handler(
 
 
 class APIProxy:
-    """A local reverse proxy that forwards to an API via an upstream proxy."""
+    """A local reverse proxy with optional caller-owned inference admission.
+
+    ``deadline_monotonic`` uses this host's ``time.monotonic()`` clock; callers
+    restore it from their original absolute cutoff, never a replenished duration.
+    ``shutdown_event`` is checked independently of scorer/container cleanup.
+    Each fresh request and explicit 429 retry needs admission after its body is
+    read. Budgeted requests do not follow redirects internally. Already admitted
+    responses may finish after the cutoff; stop/close do not prove cancellation
+    at the provider. Standalone callers without a budget retain normal routing.
+    """
 
     def __init__(
         self,
@@ -266,10 +359,14 @@ class APIProxy:
         port: int | None = None,
         injected_headers: dict[str, str] | None = None,
         rate_limit_retry_seconds: int = 0,
+        deadline_monotonic: float | None = None,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
         if type(rate_limit_retry_seconds) is not int or rate_limit_retry_seconds < 0:
             raise ValueError("rate_limit_retry_seconds must be a nonnegative integer")
         self.rate_limit_retry_seconds = rate_limit_retry_seconds
+        self._stopped = threading.Event()
+        self._admission = _RequestAdmission(self._stopped, deadline_monotonic, shutdown_event)
         self.target_url = target_url.rstrip("/")
         parsed_target = urlparse(self.target_url)
         if parsed_target.scheme not in ("http", "https") or not parsed_target.hostname:
@@ -288,7 +385,6 @@ class APIProxy:
         self._session.proxies = proxies
 
         self._client_policy: dict[str, set[str] | None] = {"allowed_ips": None}
-        self._stopped = threading.Event()
         handler = _make_handler(
             self.target_url,
             self._session,
@@ -296,6 +392,7 @@ class APIProxy:
             client_policy=self._client_policy,
             rate_limit_retry_seconds=rate_limit_retry_seconds,
             stopped=self._stopped,
+            admission=self._admission,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread: threading.Thread | None = None
@@ -326,13 +423,21 @@ class APIProxy:
             raise ValueError("API proxy requires at least one allowed client IP")
         self._client_policy["allowed_ips"] = set(allowed_ips)
 
+    def set_deadline(self, deadline_monotonic: float) -> None:
+        """Bind or tighten the cutoff; setup/resume cannot extend it."""
+        self._admission.set_deadline(deadline_monotonic)
+
+    def close_admission(self) -> None:
+        """Stop new inference immediately, before potentially slow cleanup."""
+        self._admission.close()
+
     def run_forever(self) -> None:
         """Run the proxy in the foreground (blocks until SIGINT/SIGTERM)."""
         original_sigint = signal.getsignal(signal.SIGINT)
         original_sigterm = signal.getsignal(signal.SIGTERM)
 
         def _shutdown(signum, frame):
-            self._stopped.set()
+            self.close_admission()
             print("\nShutting down API proxy...")
             threading.Thread(
                 target=self._server.shutdown, daemon=True
@@ -347,7 +452,7 @@ class APIProxy:
             signal.signal(signal.SIGTERM, original_sigterm)
 
     def stop(self) -> None:
-        self._stopped.set()
+        self.close_admission()
         if self._thread:
             self._server.shutdown()
             self._thread.join(timeout=5)
