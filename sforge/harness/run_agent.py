@@ -1351,7 +1351,8 @@ def run_agent(
             try:
                 seg_result = backend.exec_run_with_timeout(
                     handle,
-                    ["/bin/bash", "-c", run_cmd],
+                    # Solver tools can crash inside a submitted source directory.
+                    ["/bin/bash", "-c", "ulimit -S -c 0 || exit 1\n" + run_cmd],
                     timeout=segment_timeout,
                     log_file=agent_live_log,
                     workdir=task_spec.cwd,

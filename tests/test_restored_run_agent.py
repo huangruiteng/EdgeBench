@@ -19,6 +19,9 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+import shlex
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -128,6 +131,42 @@ def entry(service, monkeypatch):  # noqa: F811 - imported pytest fixture
         agent=agent,
         config=config,
     )
+
+
+def test_initial_and_resumed_solver_children_inherit_zero_soft_core_limit(entry):
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+    if hard != resource.RLIM_INFINITY and hard < 1024:
+        pytest.skip("needs a nonzero inherited core limit")
+    probe = shlex.join([
+        sys.executable, "-c",
+        "import json, resource, sys; "
+        "print(json.dumps([sys.argv[1], *resource.getrlimit(resource.RLIMIT_CORE)])); "
+        "sys.exit(17)",
+    ])
+    entry.agent.run_cmd = probe + " initial"
+    entry.agent.resume_cmd = probe + " resume"
+    observed = []
+
+    def execute(handle, cmd, **kwargs):
+        if "cat /tmp/sforge_state" in str(cmd):
+            return SimpleNamespace(output="{}")
+        # Give just the test launcher a nonzero soft limit. Run the exact argv
+        # dispatched by run_agent and observe the limit inside its child.
+        result = subprocess.run(
+            ["/bin/bash", "-c", 'ulimit -S -c 1 && exec "$@"', "launcher", *cmd],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 17
+        observed.append(json.loads(result.stdout))
+        return SimpleNamespace(
+            output="fixture", elapsed_seconds=2, timed_out=len(observed) == 2,
+        )
+
+    entry.backend.exec_run_with_timeout.side_effect = execute
+    entry.run()
+    assert observed == [["initial", 0, hard], ["resume", 0, hard]]
+    assert resource.getrlimit(resource.RLIMIT_CORE) == (soft, hard)
 
 
 def test_install_and_resume_gaps_are_charged_to_original_deadline(entry):
