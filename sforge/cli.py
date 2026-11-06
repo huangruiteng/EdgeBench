@@ -816,6 +816,9 @@ def cmd_proxy(args):
         https_proxy=https_proxy,
         host=args.host,
         port=args.port,
+        token_ledger_path=config.agent_token_ledger_path,
+        token_limit_per_minute=config.agent_token_limit_per_minute,
+        max_tokens_per_request=config.agent_max_tokens_per_request,
     )
     print(f"Starting API proxy on {proxy.local_url}")
     print(f"  Forwarding to: {proxy.target_url}")

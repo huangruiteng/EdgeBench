@@ -154,6 +154,34 @@ Other status codes and responses already forwarded are never replayed by this
 policy. Existing in-flight requests retain their request timeout. Logs contain
 retry counts and delays, not prompts, response bodies, or authorization headers.
 
+### Host-wide token admission
+
+Set all three variables below to enable hard, cross-process admission in the
+Docker host credential gateway:
+
+- `SFORGE_AGENT_TOKEN_LEDGER_PATH` — one shared host SQLite ledger;
+- `SFORGE_AGENT_TOKEN_LIMIT_PER_MINUTE` — the runner's allowed tokens per
+  rolling 60-second window;
+- `SFORGE_AGENT_MAX_TOKENS_PER_REQUEST` — a conservative upper bound for one
+  provider request, including input and output tokens.
+
+The gateway reserves the per-request bound before every fresh upstream
+dispatch. Completed response usage replaces that reservation for the rest of
+the rolling window. A response with missing or incomplete usage, or a process
+that exits with a request in flight, is charged the full bound. A provider 429
+is treated as rejected before inference and releases the reservation before an
+explicit retry. Requests wait locally while completed usage plus in-flight
+reservations would exceed the configured limit; closing the trial or reaching
+its inference deadline stops that wait without dispatch.
+
+Every process sharing a ledger must use the same per-minute limit. Choose
+`MAX_TOKENS_PER_REQUEST` from the provider/model's real request maximum: an
+observed response above it is charged at the larger actual value and closes
+future headroom, but proves the configured upper bound was invalid. The ledger
+contains only token counts, process identities and timestamps. These settings
+apply only to routes using the host credential gateway; keep external services
+and evaluator load in the capacity reserved outside this limit.
+
 ### Integration source
 
 The shared candidate for contributions from `huangruiteng` and `loopx-agent` is

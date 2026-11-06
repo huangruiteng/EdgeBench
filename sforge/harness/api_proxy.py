@@ -31,6 +31,7 @@ Usage (separate terminal):
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
@@ -41,16 +42,110 @@ import threading
 import time
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlsplit
 
 import requests as req_lib
 
+if TYPE_CHECKING:
+    from sforge.harness.token_admission import TokenAdmissionLedger
+
 logger = logging.getLogger(__name__)
 _STREAM_READ_SIZE = 64 * 1024
+_MAX_USAGE_EVENT_BYTES = 1024 * 1024
 
 
 class _AdmissionClosed(Exception):
     pass
+
+
+class _UsageAccumulator:
+    """Extract final token usage without retaining response content."""
+
+    def __init__(self, content_type: str) -> None:
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        self.sse = media_type == "text/event-stream"
+        self.json = media_type == "application/json"
+        self.buffer = bytearray()
+        self.event = bytearray()
+        self.total_tokens: int | None = None
+        self.invalid = False
+        self.overflow = False
+
+    @staticmethod
+    def _usage(value: object) -> int | None:
+        if not isinstance(value, dict):
+            return None
+        if value.get("type") == "response.completed":
+            value = value.get("response")
+        if not isinstance(value, dict):
+            return None
+        usage = value.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+        output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+        if any(type(item) is not int or item < 0 for item in (input_tokens, output_tokens)):
+            return None
+        total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+        if type(total_tokens) is not int or total_tokens != input_tokens + output_tokens:
+            return None
+        return total_tokens
+
+    def _parse(self, payload: bytes) -> None:
+        try:
+            value = json.loads(payload)
+        except (ValueError, UnicodeDecodeError):
+            return
+        tokens = self._usage(value)
+        if tokens is None:
+            return
+        if self.total_tokens is not None and self.total_tokens != tokens:
+            self.invalid = True
+            return
+        self.total_tokens = tokens
+
+    def feed(self, data: bytes) -> None:
+        if self.overflow or not (self.sse or self.json):
+            return
+        if self.json:
+            if len(self.buffer) + len(data) > _MAX_USAGE_EVENT_BYTES:
+                self.overflow = True
+                self.buffer.clear()
+            else:
+                self.buffer.extend(data)
+            return
+        self.buffer.extend(data)
+        if len(self.buffer) > _MAX_USAGE_EVENT_BYTES:
+            self.overflow = True
+            self.buffer.clear()
+            self.event.clear()
+            return
+        while b"\n" in self.buffer:
+            line, _, remaining = self.buffer.partition(b"\n")
+            self.buffer = bytearray(remaining)
+            line = line.removesuffix(b"\r")
+            if not line:
+                if self.event:
+                    self._parse(bytes(self.event))
+                self.event.clear()
+            elif line.startswith(b"data:"):
+                self.event.extend(line[5:].removeprefix(b" ") + b"\n")
+                if len(self.event) > _MAX_USAGE_EVENT_BYTES:
+                    self.overflow = True
+                    self.buffer.clear()
+                    self.event.clear()
+                    return
+
+    def finish(self) -> int | None:
+        if self.json and not self.overflow:
+            self._parse(bytes(self.buffer))
+        elif self.sse and self.event and not self.overflow:
+            self._parse(bytes(self.event))
+        self.buffer.clear()
+        self.event.clear()
+        return None if self.invalid or self.overflow else self.total_tokens
 
 
 class _RequestAdmission:
@@ -116,6 +211,16 @@ def _rate_limit_delay(value: str | None, attempt: int) -> float:
     return min(60.0, 5.0 * 2 ** min(attempt - 1, 4)) * random.uniform(0.8, 1.0)
 
 
+def _client_is_connected(connection: socket.socket) -> bool:
+    try:
+        readable, _, _ = select.select([connection], [], [], 0)
+        return not readable or bool(
+            connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def _wait_for_retry(
     connection: socket.socket, stopped: threading.Event, delay: float,
     admission: _RequestAdmission | None = None,
@@ -124,17 +229,34 @@ def _wait_for_retry(
     until = time.monotonic() + delay
     while not stopped.is_set():
         budget = admission.remaining() if admission is not None else math.inf
-        try:
-            readable, _, _ = select.select([connection], [], [], 0)
-            if readable and not connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
-                return False
-        except (OSError, ValueError):
+        if not _client_is_connected(connection):
             return False
         remaining = until - time.monotonic()
         if remaining <= 0:
             return True
         stopped.wait(min(remaining, budget, 0.25))
     return False
+
+
+def _reserve_tokens(
+    ledger: TokenAdmissionLedger | None,
+    connection: socket.socket,
+    stopped: threading.Event,
+    admission: _RequestAdmission,
+) -> str | None:
+    if ledger is None:
+        return None
+    while True:
+        admission.remaining()
+        if not _client_is_connected(connection):
+            raise _AdmissionClosed("client_disconnected")
+        reservation_id = ledger.try_reserve()
+        if reservation_id is not None:
+            if not _client_is_connected(connection):
+                ledger.release(reservation_id)
+                raise _AdmissionClosed("client_disconnected")
+            return reservation_id
+        stopped.wait(min(admission.remaining(), 0.25))
 
 
 def _find_free_port(host: str = "0.0.0.0") -> int:
@@ -151,6 +273,7 @@ def _make_handler(
     rate_limit_retry_seconds: int = 0,
     stopped: threading.Event | None = None,
     admission: _RequestAdmission | None = None,
+    token_ledger: TokenAdmissionLedger | None = None,
 ):
     """Create a request handler class that proxies to target_url via session."""
     target_base = target_url.rstrip("/")
@@ -197,6 +320,9 @@ def _make_handler(
 
             response_started = False
             resp = None
+            token_reservation = None
+            dispatch_attempted = False
+            usage_accumulator = None
             try:
                 admission.remaining()
                 body = None
@@ -205,12 +331,22 @@ def _make_handler(
                     body = self.rfile.read(int(content_length))
                     body_size = len(body)
                 while True:
+                    token_reservation = _reserve_tokens(
+                        token_ledger, self.connection, stop_event, admission
+                    )
+                    dispatch_attempted = False
                     dispatch_id, admitted_at, deadline = admission.admit()
                     logger.info(
                         "api-proxy dispatch_admitted id=%d method=%s path=%s "
                         "admitted_at_monotonic=%.6f deadline_monotonic=%s",
                         dispatch_id, self.command, request_path, admitted_at, deadline,
                     )
+                    if token_ledger is not None and not _client_is_connected(self.connection):
+                        if token_reservation is not None:
+                            token_ledger.release(token_reservation)
+                            token_reservation = None
+                        raise _AdmissionClosed("client_disconnected")
+                    dispatch_attempted = True
                     resp = session.request(
                         method=self.command,
                         url=upstream_url,
@@ -221,8 +357,17 @@ def _make_handler(
                         # Automatic redirects dispatch inside requests, beyond
                         # this admission boundary. Budgeted callers must use the
                         # final endpoint; return redirects to them unchanged.
-                        allow_redirects=deadline is None and admission.shutdown_event is None,
+                        allow_redirects=(
+                            deadline is None
+                            and admission.shutdown_event is None
+                            and token_ledger is None
+                        ),
                     )
+                    if resp.status_code == 429 and token_reservation is not None:
+                        # Provider admission rejected the request before inference.
+                        token_ledger.settle(token_reservation, 0)
+                        token_reservation = None
+                        dispatch_attempted = False
                     if resp.status_code != 429 or not rate_limit_retry_seconds:
                         break
                     delay = _rate_limit_delay(resp.headers.get("Retry-After"), rate_limit_retries + 1)
@@ -250,6 +395,8 @@ def _make_handler(
                     rate_limit_retries += 1
                 status = resp.status_code
                 content_type = resp.headers.get("Content-Type")
+                if token_reservation is not None:
+                    usage_accumulator = _UsageAccumulator(content_type or "")
                 self.send_response(resp.status_code)
                 for key, val in resp.headers.items():
                     if key.lower() in (
@@ -274,8 +421,20 @@ def _make_handler(
                     if first_byte_at is None:
                         first_byte_at = time.monotonic()
                     chunk_count += 1
+                    if usage_accumulator is not None:
+                        usage_accumulator.feed(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
+                if token_reservation is not None:
+                    actual_tokens = usage_accumulator.finish()
+                    within_bound = token_ledger.settle(token_reservation, actual_tokens)
+                    token_reservation = None
+                    dispatch_attempted = False
+                    if not within_bound:
+                        logger.error(
+                            "api-proxy observed usage above max_tokens_per_request; "
+                            "future dispatch remains fenced by actual usage"
+                        )
                 terminal_reason = "upstream_eof"
             except _AdmissionClosed as exc:
                 terminal_reason = str(exc)
@@ -302,6 +461,13 @@ def _make_handler(
                         terminal_reason = "client_disconnect"
                         logger.debug("api-proxy client disconnected before error response")
             finally:
+                if token_reservation is not None:
+                    if dispatch_attempted:
+                        # A dispatched request without complete usage is
+                        # unknown, not zero. Charge its full upper bound.
+                        token_ledger.settle(token_reservation, None)
+                    else:
+                        token_ledger.release(token_reservation)
                 if resp is not None:
                     resp.close()
                 ttfb_ms = (
@@ -347,7 +513,9 @@ class APIProxy:
     Each fresh request and explicit 429 retry needs admission after its body is
     read. Budgeted requests do not follow redirects internally. Already admitted
     responses may finish after the cutoff; stop/close do not prove cancellation
-    at the provider. Standalone callers without a budget retain normal routing.
+    at the provider. A shared token ledger counts both completed usage in the
+    last minute and conservative in-flight upper bounds. Standalone callers
+    without a budget retain normal routing.
     """
 
     def __init__(
@@ -361,12 +529,34 @@ class APIProxy:
         rate_limit_retry_seconds: int = 0,
         deadline_monotonic: float | None = None,
         shutdown_event: threading.Event | None = None,
+        token_ledger_path: str | Path | None = None,
+        token_limit_per_minute: int | None = None,
+        max_tokens_per_request: int | None = None,
     ) -> None:
         if type(rate_limit_retry_seconds) is not int or rate_limit_retry_seconds < 0:
             raise ValueError("rate_limit_retry_seconds must be a nonnegative integer")
         self.rate_limit_retry_seconds = rate_limit_retry_seconds
         self._stopped = threading.Event()
         self._admission = _RequestAdmission(self._stopped, deadline_monotonic, shutdown_event)
+        token_options = (
+            token_ledger_path,
+            token_limit_per_minute,
+            max_tokens_per_request,
+        )
+        if any(value is not None for value in token_options) and not all(
+            value is not None for value in token_options
+        ):
+            raise ValueError(
+                "token_ledger_path, token_limit_per_minute and "
+                "max_tokens_per_request must be configured together"
+            )
+        self._token_ledger = (
+            self._make_token_ledger(
+                token_ledger_path, token_limit_per_minute, max_tokens_per_request
+            )
+            if token_ledger_path is not None
+            else None
+        )
         self.target_url = target_url.rstrip("/")
         parsed_target = urlparse(self.target_url)
         if parsed_target.scheme not in ("http", "https") or not parsed_target.hostname:
@@ -393,9 +583,26 @@ class APIProxy:
             rate_limit_retry_seconds=rate_limit_retry_seconds,
             stopped=self._stopped,
             admission=self._admission,
+            token_ledger=self._token_ledger,
         )
         self._server = ThreadingHTTPServer((self.host, self.port), handler)
         self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def _make_token_ledger(
+        path: str | Path,
+        token_limit_per_minute: int,
+        max_tokens_per_request: int,
+    ) -> TokenAdmissionLedger:
+        try:
+            from sforge.harness.token_admission import TokenAdmissionLedger
+        except ModuleNotFoundError as exc:
+            if exc.name in {"sqlite3", "_sqlite3"}:
+                raise RuntimeError("token admission requires Python sqlite3 support") from exc
+            raise
+        return TokenAdmissionLedger(
+            path, token_limit_per_minute, max_tokens_per_request
+        )
 
     @property
     def local_url(self) -> str:
