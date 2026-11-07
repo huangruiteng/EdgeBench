@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from sforge.harness.benchmark_integrity_attestation import (
@@ -19,7 +20,14 @@ def _write(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
-def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
+def _fixture(
+    tmp_path: Path,
+    *,
+    with_active_feedback: bool = True,
+    history_entries: list[dict] | None = None,
+    feedback_records: list[dict] | None = None,
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     key = tmp_path / "attestation.key"
     key.write_bytes(b"test-only-runtime-attestation-key-32-bytes")
     os.chmod(key, 0o600)
@@ -88,13 +96,8 @@ def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
             "timed_out": True,
         }],
     }
-    history = {
-        "run_id": run_id,
-        "best_score": -0.75,
-        "best_pass_rate": 0.5,
-        "agent_submissions": 2,
-        "auto_submissions": 3,
-        "entries": [{
+    if history_entries is None:
+        history_entries = [{
             "type": "submission",
             "status": "completed",
             "submission_id": "submission-1",
@@ -104,7 +107,20 @@ def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
             "evaluation_started_at": solver_started + 0.002,
             "evaluation_completed_at": solver_started + 0.003,
             "archive_sha256": "a" * 64,
-        }],
+        }]
+    history = {
+        "run_id": run_id,
+        "best_score": -0.75,
+        "best_pass_rate": 0.5,
+        "agent_submissions": sum(
+            str(item.get("round") or "").startswith("agent-")
+            for item in history_entries
+        ),
+        "auto_submissions": sum(
+            str(item.get("round") or "").startswith("auto-")
+            for item in history_entries
+        ),
+        "entries": history_entries,
     }
     _write(root / "solver_execution.json", solver)
     _write(root / "run_history.json", history)
@@ -128,7 +144,7 @@ def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
     }
     _write(root / "grading_status.json", grading)
     _write(root / "worker-profile.json", worker)
-    transport_records = [
+    default_transport_records = [
         {
             "schema_version": "sforge_feedback_transport_v1",
             "sequence": 1,
@@ -158,6 +174,9 @@ def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
             "payload_sha256": "c" * 64,
         },
     ]
+    transport_records = (
+        default_transport_records if feedback_records is None else feedback_records
+    )
     if with_active_feedback:
         (root / "feedback-transport.jsonl").write_text(
             "".join(json.dumps(item) + "\n" for item in transport_records),
@@ -191,8 +210,8 @@ def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
             "outcome": {
                 "grading_status": "complete",
                 "grading_reason": "drained",
-                "agent_submissions": 2,
-                "background_submissions": 3,
+                "agent_submissions": history["agent_submissions"],
+                "background_submissions": history["auto_submissions"],
                 "best_score": -0.75,
                 "best_pass_rate": 0.5,
             },
@@ -256,6 +275,82 @@ def test_qualifies_when_active_feedback_channel_was_unused(tmp_path):
         "response_ack_count": 0,
         "journal_sha256": None,
     }
+
+
+def test_rejects_submission_history_that_violates_declared_cadence(tmp_path):
+    base = time.time() + 0.1
+    entries = []
+    for index, (kind, offset) in enumerate(
+        (("agent", 0), ("agent", 1), ("auto", 0), ("auto", 1)), 1
+    ):
+        entries.append({
+            "type": "submission",
+            "status": "completed",
+            "submission_id": f"submission-{index}",
+            "task_id": "case-1",
+            "round": f"{kind}-{1 if index % 2 else 2}",
+            "submitted_at": base + offset,
+            "evaluation_started_at": base + offset + 0.1,
+            "evaluation_completed_at": base + offset + 0.2,
+            "archive_sha256": f"{index:x}" * 64,
+        })
+
+    receipt = _qualify(_fixture(tmp_path, history_entries=entries))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_submission_cadence_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_rejects_evaluation_that_completed_after_drain(tmp_path):
+    fixture = _fixture(tmp_path)
+    root = fixture[1]
+    grading = json.loads((root / "grading_status.json").read_text())
+    drain_completed = grading["completed_at_unix"]
+
+    # Rebuild a complete, signed run whose evaluator claims to finish after the
+    # drain.  Passing this through the fixture avoids an unsigned-file mutation.
+    entry = {
+        "type": "submission",
+        "status": "completed",
+        "submission_id": "submission-1",
+        "task_id": "case-1",
+        "round": "agent-1",
+        "submitted_at": drain_completed - 2,
+        "evaluation_started_at": drain_completed - 1,
+        "evaluation_completed_at": drain_completed + 100,
+        "archive_sha256": "a" * 64,
+    }
+    receipt = _qualify(_fixture(tmp_path / "late", history_entries=[entry]))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_evaluation_after_drain" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_rejects_feedback_request_without_matching_response(tmp_path):
+    request_only = [{
+        "schema_version": "sforge_feedback_transport_v1",
+        "sequence": 1,
+        "exchange_id": "exchange-1",
+        "record_kind": "request",
+        "observed_at_unix": 2_000_000_000.0,
+        "run_id": "run-1",
+        "task_id": "case-1",
+        "channel": "active_submission",
+        "operation": "result",
+        "subject_id": "submission-1",
+        "payload_sha256": "b" * 64,
+    }]
+
+    receipt = _qualify(_fixture(tmp_path, feedback_records=request_only))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_feedback_journal_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
 
 
 def test_policy_mismatch_fails_closed(tmp_path):

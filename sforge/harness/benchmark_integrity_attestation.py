@@ -83,6 +83,62 @@ def _milliseconds(value: object) -> int | None:
     return round(float(value) * 1000) if _finite(value) else None
 
 
+def _cadence_valid(
+    submissions: Sequence[Mapping[str, Any]],
+    *,
+    active_evaluation: Mapping[str, Any],
+    background_evaluation: Mapping[str, Any],
+) -> bool:
+    """Verify observed submission spacing against the admitted protocol."""
+
+    active_times: list[int] = []
+    background_times: list[int] = []
+    for item in submissions:
+        captured = item.get("captured_at_ms")
+        round_id = str(item.get("round_id") or "")
+        if not _finite(captured):
+            return False
+        if round_id.startswith("agent-"):
+            active_times.append(round(float(captured)))
+        elif round_id.startswith("auto-"):
+            background_times.append(round(float(captured)))
+        else:
+            return False
+
+    maximum = active_evaluation.get("max_submissions")
+    if maximum is not None and (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum < 0
+        or len(active_times) > maximum
+    ):
+        return False
+    cooldown = active_evaluation.get("cooldown_seconds")
+    if cooldown is not None:
+        if not _finite(cooldown):
+            return False
+        minimum = round(float(cooldown) * 1000)
+        ordered = sorted(active_times)
+        if any(right - left < minimum for left, right in zip(ordered, ordered[1:])):
+            return False
+
+    enabled = background_evaluation.get("enabled")
+    interval = background_evaluation.get("interval_seconds")
+    if (
+        not isinstance(enabled, bool)
+        or not _finite(interval)
+        or (enabled and float(interval) <= 0)
+    ):
+        return False
+    if not enabled:
+        return not background_times
+    minimum = round(float(interval) * 1000)
+    ordered = sorted(background_times)
+    return not any(
+        right - left < minimum for left, right in zip(ordered, ordered[1:])
+    )
+
+
 def _feedback_transport(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not path.is_file():
         return [], {
@@ -112,9 +168,34 @@ def _feedback_transport(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any
 
     requests = [item for item in records if item.get("record_kind") == "request"]
     responses = [item for item in records if item.get("record_kind") == "response"]
-    request_ids = {str(item.get("exchange_id") or "") for item in requests}
-    response_ids = {str(item.get("exchange_id") or "") for item in responses}
-    valid = valid and bool(request_ids) and response_ids.issubset(request_ids)
+    valid = valid and len(requests) + len(responses) == len(records)
+    request_by_id: dict[str, list[dict[str, Any]]] = {}
+    response_by_id: dict[str, list[dict[str, Any]]] = {}
+    for item in requests:
+        request_by_id.setdefault(str(item.get("exchange_id") or ""), []).append(item)
+    for item in responses:
+        response_by_id.setdefault(str(item.get("exchange_id") or ""), []).append(item)
+    valid = (
+        valid
+        and bool(request_by_id)
+        and request_by_id.keys() == response_by_id.keys()
+    )
+    for exchange_id, matched_requests in request_by_id.items():
+        matched_responses = response_by_id.get(exchange_id, [])
+        if not exchange_id or len(matched_requests) != 1 or len(matched_responses) != 1:
+            valid = False
+            continue
+        request = matched_requests[0]
+        response = matched_responses[0]
+        request_at = request.get("observed_at_unix")
+        response_at = response.get("observed_at_unix")
+        if (
+            not _finite(request_at)
+            or not _finite(response_at)
+            or float(response_at) < float(request_at)
+            or int(response.get("sequence") or 0) <= int(request.get("sequence") or 0)
+        ):
+            valid = False
 
     deliveries: list[dict[str, Any]] = []
     delivered_subjects: set[str] = set()
@@ -251,6 +332,22 @@ def build_benchmark_runtime_integrity_attestation(
     if entries and not submissions:
         timing_complete = False
 
+    active_evaluation = protocol.get("active_evaluation")
+    active_evaluation = (
+        active_evaluation if isinstance(active_evaluation, Mapping) else {}
+    )
+    background_evaluation = protocol.get("background_evaluation")
+    background_evaluation = (
+        background_evaluation
+        if isinstance(background_evaluation, Mapping)
+        else {}
+    )
+    cadence_valid = _cadence_valid(
+        submissions,
+        active_evaluation=active_evaluation,
+        background_evaluation=background_evaluation,
+    )
+
     deliveries, transport = _feedback_transport(
         evidence_root / "feedback-transport.jsonl"
     )
@@ -262,6 +359,16 @@ def build_benchmark_runtime_integrity_attestation(
     )
     history_digest_matches = (
         grading.get("history_sha256") == _sha256_file(evidence_root / history_name)
+    )
+    drain_completed = _milliseconds(grading.get("completed_at_unix"))
+    evaluations_before_drain = (
+        drain_completed is not None
+        and bool(submissions)
+        and all(
+            item["evaluation_completed_at_ms"] is not None
+            and item["evaluation_completed_at_ms"] <= drain_completed
+            for item in submissions
+        )
     )
     evaluator_after_agent = (
         bool(submissions)
@@ -297,10 +404,12 @@ def build_benchmark_runtime_integrity_attestation(
     protocol_enforced = (
         admission.get("status") == "accepted"
         and ready.get("status") == "ready"
-        and isinstance(protocol.get("active_evaluation"), Mapping)
-        and isinstance(protocol.get("background_evaluation"), Mapping)
+        and bool(active_evaluation)
+        and bool(background_evaluation)
+        and cadence_valid
         and timing_complete
         and timing_ordered
+        and evaluations_before_drain
         and grading_complete
         and history_digest_matches
         and transport["journal_valid"]
@@ -348,7 +457,10 @@ def build_benchmark_runtime_integrity_attestation(
         ),
         "evaluation_protocol_enforced": protocol_enforced,
         "evaluation_log_complete": (
-            grading_complete and history_digest_matches and timing_complete
+            grading_complete
+            and history_digest_matches
+            and timing_complete
+            and evaluations_before_drain
         ),
         "evaluation_protocol": {
             "run_id": run_id,
@@ -365,6 +477,14 @@ def build_benchmark_runtime_integrity_attestation(
                 grading.get("completed_at_unix")
             ),
             "evaluation_drain_seconds": grading.get("elapsed_seconds"),
+            "active_evaluation": {
+                "max_submissions": active_evaluation.get("max_submissions"),
+                "cooldown_seconds": active_evaluation.get("cooldown_seconds"),
+            },
+            "background_evaluation": {
+                "enabled": background_evaluation.get("enabled"),
+                "interval_seconds": background_evaluation.get("interval_seconds"),
+            },
             "submissions": submissions,
             "deliveries": deliveries,
             "evaluation_history_sha256": grading.get("history_sha256"),
@@ -445,10 +565,12 @@ def benchmark_runtime_integrity_failures(
     if not isinstance(submissions, list) or not submissions:
         failures.append("benchmark_integrity_submission_timing_missing")
         submissions = []
+    cadence_submissions: list[Mapping[str, Any]] = []
     for item in submissions:
         if not isinstance(item, Mapping):
             failures.append("benchmark_integrity_submission_timing_invalid")
             continue
+        cadence_submissions.append(item)
         timing = [
             item.get("captured_at_ms"),
             item.get("evaluation_started_at_ms"),
@@ -461,6 +583,35 @@ def benchmark_runtime_integrity_failures(
         digest = item.get("submission_sha256")
         if not isinstance(digest, str) or len(digest) != 64:
             failures.append("benchmark_integrity_submission_digest_missing")
+
+    active_evaluation = protocol.get("active_evaluation")
+    background_evaluation = protocol.get("background_evaluation")
+    if (
+        not isinstance(active_evaluation, Mapping)
+        or not isinstance(background_evaluation, Mapping)
+        or not _cadence_valid(
+            cadence_submissions,
+            active_evaluation=(
+                active_evaluation
+                if isinstance(active_evaluation, Mapping)
+                else {}
+            ),
+            background_evaluation=(
+                background_evaluation
+                if isinstance(background_evaluation, Mapping)
+                else {}
+            ),
+        )
+    ):
+        failures.append("benchmark_integrity_submission_cadence_invalid")
+
+    drain_completed = protocol.get("evaluation_drain_completed_at_ms")
+    if _finite(drain_completed) and any(
+        _finite(item.get("evaluation_completed_at_ms"))
+        and float(item["evaluation_completed_at_ms"]) > float(drain_completed)
+        for item in cadence_submissions
+    ):
+        failures.append("benchmark_integrity_evaluation_after_drain")
 
     transport = value.get("feedback_transport")
     if not isinstance(transport, Mapping):
@@ -476,6 +627,11 @@ def benchmark_runtime_integrity_failures(
             or transport.get("response_ack_count") != 0
         ):
             failures.append("benchmark_integrity_feedback_journal_missing")
+        if transport.get("journal_present") is True and (
+            transport.get("request_count") != transport.get("response_ack_count")
+            or transport.get("request_count") == 0
+        ):
+            failures.append("benchmark_integrity_feedback_journal_invalid")
     public_boundary = value.get("public_boundary")
     if (
         not isinstance(public_boundary, Mapping)
