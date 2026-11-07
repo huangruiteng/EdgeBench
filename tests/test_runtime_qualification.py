@@ -5,6 +5,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from sforge.harness.benchmark_integrity_attestation import (
+    write_benchmark_runtime_integrity_attestation,
+)
 from sforge.harness.runtime_attestation import RuntimeAttestationRecorder
 from sforge.harness.runtime_qualification import (
     POLICY_SCHEMA_VERSION,
@@ -20,10 +23,10 @@ def _fixture(tmp_path: Path):
     key = tmp_path / "attestation.key"
     key.write_bytes(b"test-only-runtime-attestation-key-32-bytes")
     os.chmod(key, 0o600)
-    root = tmp_path / "run"
-    root.mkdir()
     run_id = "run-1"
     task_id = "case-1"
+    root = tmp_path / "runs" / run_id / task_id
+    root.mkdir(parents=True)
     source = "0123456789abcdef"
     protocol = {
         "backend": "docker",
@@ -40,6 +43,7 @@ def _fixture(tmp_path: Path):
         protocol=protocol,
     )
     recorder.record("admission", "accepted", {"restored_execution": False})
+    admitted_at = recorder.records[0]["payload"]["observed_at_unix"]
     ready = {
         "container": {"backend": "docker", "name": "container"},
         "network_boundary": {
@@ -48,20 +52,39 @@ def _fixture(tmp_path: Path):
         },
         "credential_boundary": {
             "mode": "host_gateway",
+            "provider_credential_configured": True,
             "real_credential_absent_from_container": True,
             "gateway_client_ip_restricted": True,
         },
+        "isolation_boundary": {
+            "inspection_complete": True,
+            "unprivileged": True,
+            "host_pid_namespace_absent": True,
+            "host_network_namespace_absent": True,
+            "host_mounts_absent": True,
+            "docker_socket_absent": True,
+        },
+        "evaluation_boundary": {
+            "run_task_scope_enforced": True,
+            "judge_token_absent_from_solver": True,
+            "admin_secret_absent_from_solver": True,
+            "evaluator_image_separate": True,
+            "background_results_absent_from_solver_history": True,
+        },
     }
     recorder.record("solver_ready", "ready", ready)
+
+    solver_started = admitted_at + 0.01
+    solver_finished = admitted_at + 0.02
 
     solver = {
         "schema_version": 1,
         "status": "timed_out",
         "segments": [{
             "index": 1,
-            "started_at": 100.0,
-            "finished_at": 200.0,
-            "elapsed_seconds": 100.0,
+            "started_at": solver_started,
+            "finished_at": solver_finished,
+            "elapsed_seconds": 0.01,
             "timed_out": True,
         }],
     }
@@ -71,7 +94,17 @@ def _fixture(tmp_path: Path):
         "best_pass_rate": 0.5,
         "agent_submissions": 2,
         "auto_submissions": 3,
-        "entries": [],
+        "entries": [{
+            "type": "submission",
+            "status": "completed",
+            "submission_id": "submission-1",
+            "task_id": task_id,
+            "round": "agent-1",
+            "submitted_at": solver_started + 0.001,
+            "evaluation_started_at": solver_started + 0.002,
+            "evaluation_completed_at": solver_started + 0.003,
+            "archive_sha256": "a" * 64,
+        }],
     }
     _write(root / "solver_execution.json", solver)
     _write(root / "run_history.json", history)
@@ -81,8 +114,11 @@ def _fixture(tmp_path: Path):
         "reason": "drained",
         "pending_submissions": 0,
         "elapsed_seconds": 12.5,
+        "started_at_unix": solver_finished + 0.001,
+        "completed_at_unix": solver_finished + 12.501,
         "history_observed": True,
         "history_sha256": history_sha,
+        "history_file": "run_history.json",
     }
     worker = {
         "profile": "native-goal",
@@ -92,8 +128,43 @@ def _fixture(tmp_path: Path):
     }
     _write(root / "grading_status.json", grading)
     _write(root / "worker-profile.json", worker)
+    transport_records = [
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 1,
+            "exchange_id": "exchange-1",
+            "record_kind": "request",
+            "observed_at_unix": solver_started + 0.004,
+            "run_id": run_id,
+            "task_id": task_id,
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": "submission-1",
+            "payload_sha256": "b" * 64,
+        },
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 2,
+            "exchange_id": "exchange-1",
+            "record_kind": "response",
+            "observed_at_unix": solver_started + 0.005,
+            "run_id": run_id,
+            "task_id": task_id,
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": "submission-1",
+            "subject_status": "completed",
+            "status": "delivered",
+            "payload_sha256": "c" * 64,
+        },
+    ]
     (root / "feedback-transport.jsonl").write_text(
-        '{"content_free":"synthetic"}\n', encoding="utf-8",
+        "".join(json.dumps(item) + "\n" for item in transport_records),
+        encoding="utf-8",
+    )
+    benchmark_integrity = write_benchmark_runtime_integrity_attestation(
+        records=recorder.records,
+        evidence_root=root,
     )
     recorder.record(
         "terminal",
@@ -101,7 +172,7 @@ def _fixture(tmp_path: Path):
         {
             "solver": {
                 "timed_out": True,
-                "runtime_seconds": 100.0,
+                "runtime_seconds": 0.01,
                 "execution_status": "timed_out",
             },
             "evaluation": grading,
@@ -120,6 +191,7 @@ def _fixture(tmp_path: Path):
             "run_history.json": root / "run_history.json",
             "worker-profile.json": root / "worker-profile.json",
             "feedback-transport.jsonl": root / "feedback-transport.jsonl",
+            benchmark_integrity.name: benchmark_integrity,
         },
     )
     policy = {
@@ -153,9 +225,9 @@ def test_qualifies_complete_signed_runtime_without_analyst_backfill(tmp_path):
     assert receipt["blockers"] == []
     assert all(receipt["checks"].values())
     assert receipt["timing"] == {
-        "solver_started_at_unix": 100.0,
-        "solver_finished_at_unix": 200.0,
-        "solver_runtime_seconds": 100.0,
+        "solver_started_at_unix": receipt["timing"]["solver_started_at_unix"],
+        "solver_finished_at_unix": receipt["timing"]["solver_finished_at_unix"],
+        "solver_runtime_seconds": 0.01,
         "evaluation_drain_seconds": 12.5,
     }
     assert receipt["public_boundary"]["analyst_backfill_used"] is False
@@ -210,6 +282,7 @@ def test_cli_emits_public_receipt_and_requires_qualification(tmp_path):
             "--expected-source-revision",
             source,
             "--require-qualified",
+            "--require-benchmark-integrity",
         ],
         check=True,
         text=True,

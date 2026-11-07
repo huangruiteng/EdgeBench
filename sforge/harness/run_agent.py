@@ -48,6 +48,9 @@ import requests
 
 from sforge.harness.agent import Agent
 from sforge.harness.backend import ContainerBackend, ContainerHandle
+from sforge.harness.benchmark_integrity_attestation import (
+    write_benchmark_runtime_integrity_attestation,
+)
 from sforge.harness.config import SForgeConfig, sanitize_e2b_proxy_env
 from sforge.harness.constants import get_admin_secret
 from sforge.harness.docker_build import (
@@ -646,12 +649,15 @@ def _write_grading(log_dir: Path, history_file: str, result: _GradingResult,
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_bytes(raw)
     temp.replace(path)
+    completed_at = time.time()
     status = {
         "schema_version": 1,
         "status": result.status,
         "reason": result.reason,
         "pending_submissions": result.pending_submissions,
         "elapsed_seconds": result.elapsed_seconds,
+        "started_at_unix": completed_at - result.elapsed_seconds,
+        "completed_at_unix": completed_at,
         "wait_budget_seconds": result.wait_budget_seconds,
         "history_file": history_file,
         "history_observed": result.history is not None,
@@ -725,6 +731,50 @@ def _runtime_protocol(
     }
 
 
+def _container_isolation_boundary(backend: ContainerBackend, handle) -> dict:
+    """Inspect the live solver container without recording host paths or secrets."""
+
+    facts = {
+        "backend": backend.backend_name,
+        "inspection_complete": False,
+        "unprivileged": False,
+        "host_pid_namespace_absent": False,
+        "host_network_namespace_absent": False,
+        "host_mounts_absent": False,
+        "docker_socket_absent": False,
+    }
+    if backend.backend_name != "docker":
+        return facts
+    container = getattr(handle, "raw", None)
+    try:
+        container.reload()
+        attrs = container.attrs
+        if not isinstance(attrs, dict):
+            return facts
+        host = attrs.get("HostConfig") or {}
+        mounts = attrs.get("Mounts") or []
+    except Exception:  # noqa: BLE001 - optional inspection fails closed in facts
+        return facts
+    if not isinstance(host, dict) or not isinstance(mounts, list):
+        return facts
+    destinations = {
+        str(item.get("Destination") or "")
+        for item in mounts
+        if isinstance(item, dict)
+    }
+    facts.update(
+        inspection_complete=True,
+        unprivileged=host.get("Privileged") is False,
+        host_pid_namespace_absent=host.get("PidMode") not in {"host", "container:host"},
+        host_network_namespace_absent=host.get("NetworkMode") != "host",
+        host_mounts_absent=not mounts and not host.get("Binds"),
+        docker_socket_absent=not destinations.intersection(
+            {"/var/run/docker.sock", "/run/docker.sock"}
+        ),
+    )
+    return facts
+
+
 def _record_terminal_attestation(
     recorder: RuntimeAttestationRecorder | None,
     log_dir: Path,
@@ -747,6 +797,10 @@ def _record_terminal_attestation(
                 }
         except (OSError, ValueError):
             evaluation = {"status": "unreadable"}
+    benchmark_integrity = write_benchmark_runtime_integrity_attestation(
+        records=recorder.records,
+        evidence_root=log_dir,
+    )
     evidence = {
         name: log_dir / name for name in (
             "solver_execution.json", "grading_status.json", "run_history.json",
@@ -754,6 +808,7 @@ def _record_terminal_attestation(
             "feedback-transport.jsonl",
         )
     }
+    evidence[benchmark_integrity.name] = benchmark_integrity
     recorder.record(
         "terminal",
         "complete" if result.grading_status == "complete" else "incomplete",
@@ -1258,6 +1313,20 @@ def run_agent(
                         "mode": credential_mode,
                         "real_credential_absent_from_container": credential_proxy is not None,
                         "gateway_client_ip_restricted": credential_proxy is not None,
+                    },
+                    "isolation_boundary": _container_isolation_boundary(
+                        backend, handle,
+                    ),
+                    "evaluation_boundary": {
+                        "run_task_scope_enforced": bool(
+                            session_token and feedback_relay_id
+                        ),
+                        "judge_token_absent_from_solver": True,
+                        "admin_secret_absent_from_solver": True,
+                        "evaluator_image_separate": (
+                            task_spec.work_image_key != task_spec.judge_image_key
+                        ),
+                        "background_results_absent_from_solver_history": True,
                     },
                 },
                 evidence_files={"prompt": log_dir / "agent_prompt.md"},

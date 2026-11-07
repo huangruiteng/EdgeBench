@@ -97,6 +97,7 @@ class RuntimeAttestationRecorder:
         self._protocol = protocol
         self._sequence = 0
         self._previous_payload_sha256: str | None = None
+        self._records: list[dict[str, Any]] = []
 
         journal = self._log_dir / JOURNAL_FILE
         latest = self._log_dir / LATEST_FILE
@@ -116,10 +117,17 @@ class RuntimeAttestationRecorder:
                 raise ValueError("Restored runtime protocol does not match attested protocol")
             self._sequence = len(records)
             self._previous_payload_sha256 = records[-1]["signature"]["payload_sha256"]
+            self._records = records
 
     @property
     def identity(self) -> dict[str, str]:
         return dict(self._identity)
+
+    @property
+    def records(self) -> tuple[dict[str, Any], ...]:
+        """Return observations already persisted by this runner instance."""
+
+        return tuple(self._records)
 
     def record(
         self,
@@ -184,6 +192,7 @@ class RuntimeAttestationRecorder:
         os.chmod(temporary, 0o600)
         temporary.replace(latest_path)
         self._previous_payload_sha256 = payload_sha256
+        self._records.append(record)
         return record
 
 

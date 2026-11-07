@@ -89,6 +89,14 @@ boundaries, the active and background evaluation protocol, and terminal grading
 timing. The signing key and its path are never sent to a Work or Judge container
 or copied into run configuration.
 
+At terminal collection the runner also writes
+`benchmark-runtime-integrity-attestation.json`. Its compact
+`benchmark_runtime_integrity_attestation_v0` projection contains the live Docker
+isolation inspection, scoped evaluation boundary, per-submission evaluation
+timing, feedback-transport digests, and grading-drain timing. The terminal HMAC
+record signs this file's digest, so a later analyst cannot fill in a missing
+boundary or timing field.
+
 Keep the key outside the log tree and retain it in the trusted analysis
 environment. A missing key, an insecure key file, an absent source revision, a
 changed record, or a mismatched restored protocol fails closed. Historical runs
@@ -102,6 +110,12 @@ sforge verify-attestation \
   --expected-run-id <run> --expected-task-id <task> \
   --expected-source-revision <commit>
 ```
+
+Use `sforge qualify-attestation --require-qualified
+--require-benchmark-integrity ...` when both the lower-level runtime receipt and
+the runner-owned benchmark integrity projection are required. Historical runs
+without the signed projection keep their runtime qualification but fail the
+benchmark-integrity requirement explicitly.
 :::
 
 ## Judge Variables

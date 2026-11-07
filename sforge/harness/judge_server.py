@@ -237,8 +237,19 @@ class GameSessionState:
     )
 
 
-def submission_history_entry(submission_id: str, task_id: str, round_id: str | None,
-                             report_dict: dict | None, error: str | None, status: str) -> dict:
+def submission_history_entry(
+    submission_id: str,
+    task_id: str,
+    round_id: str | None,
+    report_dict: dict | None,
+    error: str | None,
+    status: str,
+    *,
+    submitted_at: float | None = None,
+    evaluation_started_at: float | None = None,
+    evaluation_completed_at: float | None = None,
+    archive_sha256: str | None = None,
+) -> dict:
     entry: dict[str, Any] = {
         "type": "submission",
         "status": status,
@@ -259,6 +270,14 @@ def submission_history_entry(submission_id: str, task_id: str, round_id: str | N
                 entry[key] = report_dict[key]
     if error:
         entry["error"] = error
+    for key, value in (
+        ("submitted_at", submitted_at),
+        ("evaluation_started_at", evaluation_started_at),
+        ("evaluation_completed_at", evaluation_completed_at),
+        ("archive_sha256", archive_sha256),
+    ):
+        if value is not None:
+            entry[key] = value
     return entry
 
 
@@ -1140,7 +1159,19 @@ class JudgeState:
         return info["task_id"], info["run_id"], round_id, info.get("judge_cpu_limit"), info.get("judge_mem_limit"), remaining
 
     def _record_submission(self, run_id: str, submission_id: str, task_id: str, round_id: str | None, report_dict: dict | None, error: str | None, status: str = "completed") -> None:
-        entry = submission_history_entry(submission_id, task_id, round_id, report_dict, error, status)
+        observed = self.submissions.get(submission_id) or {}
+        entry = submission_history_entry(
+            submission_id,
+            task_id,
+            round_id,
+            report_dict,
+            error,
+            status,
+            submitted_at=observed.get("submitted_at"),
+            evaluation_started_at=observed.get("evaluation_started_at"),
+            evaluation_completed_at=observed.get("evaluation_completed_at"),
+            archive_sha256=observed.get("archive_sha256"),
+        )
         history_key = f"{run_id}/{task_id}"
         with self._history_lock:
             entries = self.run_history.setdefault(history_key, [])
@@ -1425,7 +1456,10 @@ class JudgeState:
     def _grade_worker(self, submission_id: str, task_id: str, archive: bytes,
                       run_id: str | None = None, round: str | None = None,
                       judge_cpu_limit: int | None = None, judge_mem_limit: str | None = None) -> None:
-        self.submissions[submission_id]["status"] = SubmissionStatus.RUNNING
+        self.submissions[submission_id].update(
+            status=SubmissionStatus.RUNNING,
+            evaluation_started_at=time.time(),
+        )
         self._record_submission(run_id or submission_id, submission_id, task_id,
                                 round, None, None, status="running")
         try:
@@ -1454,13 +1488,19 @@ class JudgeState:
             report_dict = report.to_dict()
             report_dict.pop("score_0_100", None)
             with self._registration_lock:
-                self.submissions[submission_id]["status"] = SubmissionStatus.COMPLETED
-                self.submissions[submission_id]["report"] = report_dict
+                self.submissions[submission_id].update(
+                    status=SubmissionStatus.COMPLETED,
+                    report=report_dict,
+                    evaluation_completed_at=time.time(),
+                )
                 self._record_submission(log_run_id, submission_id, task_id, round, report_dict, None)
         except Exception as e:
             with self._registration_lock:
-                self.submissions[submission_id]["status"] = SubmissionStatus.ERROR
-                self.submissions[submission_id]["error"] = str(e)
+                self.submissions[submission_id].update(
+                    status=SubmissionStatus.ERROR,
+                    error=str(e),
+                    evaluation_completed_at=time.time(),
+                )
                 self._record_submission(log_run_id, submission_id, task_id, round, None, str(e), status=SubmissionStatus.ERROR)
 
     def get_result(self, submission_id: str) -> dict | None:
@@ -2161,6 +2201,7 @@ def create_app(
             subject_id=submission_id,
             payload=payload,
             status="delivered",
+            subject_status=result["status"],
         )
         return ResultResponse(**payload)
 
