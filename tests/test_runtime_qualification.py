@@ -26,6 +26,8 @@ def _fixture(
     with_active_feedback: bool = True,
     history_entries: list[dict] | None = None,
     feedback_records: list[dict] | None = None,
+    solver_runtime_seconds: float = 0.01,
+    max_agent_submissions: int | None = None,
 ):
     tmp_path.mkdir(parents=True, exist_ok=True)
     key = tmp_path / "attestation.key"
@@ -40,7 +42,10 @@ def _fixture(
         "backend": "docker",
         "solver_timeout_seconds": 64800,
         "background_evaluation": {"enabled": True, "interval_seconds": 300},
-        "active_evaluation": {"cooldown_seconds": 3600},
+        "active_evaluation": {
+            "cooldown_seconds": 3600,
+            "max_submissions": max_agent_submissions,
+        },
     }
     recorder = RuntimeAttestationRecorder(
         root,
@@ -83,7 +88,7 @@ def _fixture(
     recorder.record("solver_ready", "ready", ready)
 
     solver_started = admitted_at + 0.01
-    solver_finished = admitted_at + 0.02
+    solver_finished = solver_started + solver_runtime_seconds
 
     solver = {
         "schema_version": 1,
@@ -303,6 +308,40 @@ def test_rejects_submission_history_that_violates_declared_cadence(tmp_path):
     )
 
 
+def test_rejects_long_background_enabled_run_without_auto_submission(tmp_path):
+    receipt = _qualify(_fixture(tmp_path, solver_runtime_seconds=1000))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_submission_cadence_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_rejects_noncontiguous_submission_round_history(tmp_path):
+    now = time.time() + 0.1
+    entry = {
+        "type": "submission",
+        "status": "completed",
+        "submission_id": "submission-2",
+        "task_id": "case-1",
+        "round": "agent-2",
+        "submitted_at": now,
+        "evaluation_started_at": now + 0.1,
+        "evaluation_completed_at": now + 0.2,
+        "archive_sha256": "a" * 64,
+    }
+    receipt = _qualify(_fixture(
+        tmp_path,
+        history_entries=[entry],
+        max_agent_submissions=1,
+    ))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_submission_cadence_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
 def test_rejects_evaluation_that_completed_after_drain(tmp_path):
     fixture = _fixture(tmp_path)
     root = fixture[1]
@@ -346,6 +385,47 @@ def test_rejects_feedback_request_without_matching_response(tmp_path):
     }]
 
     receipt = _qualify(_fixture(tmp_path, feedback_records=request_only))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_feedback_journal_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_rejects_feedback_response_with_mismatched_request_identity(tmp_path):
+    observed = time.time()
+    records = [
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 1,
+            "exchange_id": "exchange-1",
+            "record_kind": "request",
+            "observed_at_unix": observed,
+            "run_id": "run-1",
+            "task_id": "case-1",
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": "submission-1",
+            "payload_sha256": "b" * 64,
+        },
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 2,
+            "exchange_id": "exchange-1",
+            "record_kind": "response",
+            "observed_at_unix": observed + 0.1,
+            "run_id": "other-run",
+            "task_id": "other-case",
+            "channel": "game",
+            "operation": "history",
+            "subject_id": "other-submission",
+            "status": "delivered",
+            "subject_status": "completed",
+            "payload_sha256": "c" * 64,
+        },
+    ]
+
+    receipt = _qualify(_fixture(tmp_path, feedback_records=records))
 
     assert receipt["benchmark_integrity_qualified"] is False
     assert "benchmark_integrity_feedback_journal_invalid" in (

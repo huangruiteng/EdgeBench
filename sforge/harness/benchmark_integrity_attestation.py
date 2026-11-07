@@ -89,11 +89,15 @@ def _cadence_valid(
     *,
     active_evaluation: Mapping[str, Any],
     background_evaluation: Mapping[str, Any],
+    solver_started_at_ms: object,
+    solver_ended_at_ms: object,
 ) -> bool:
     """Verify observed submission spacing against the admitted protocol."""
 
     active_times: list[int] = []
     background_times: list[int] = []
+    active_rounds: list[int] = []
+    background_rounds: list[int] = []
     for item in submissions:
         captured = item.get("captured_at_ms")
         round_id = str(item.get("round_id") or "")
@@ -101,10 +105,22 @@ def _cadence_valid(
             return False
         if round_id.startswith("agent-"):
             active_times.append(round(float(captured)))
+            suffix = round_id.removeprefix("agent-")
+            target = active_rounds
         elif round_id.startswith("auto-"):
             background_times.append(round(float(captured)))
+            suffix = round_id.removeprefix("auto-")
+            target = background_rounds
         else:
             return False
+        if not suffix.isdigit() or int(suffix) < 1 or str(int(suffix)) != suffix:
+            return False
+        target.append(int(suffix))
+
+    if sorted(active_rounds) != list(range(1, len(active_rounds) + 1)):
+        return False
+    if sorted(background_rounds) != list(range(1, len(background_rounds) + 1)):
+        return False
 
     maximum = active_evaluation.get("max_submissions")
     if maximum is not None and (
@@ -134,13 +150,23 @@ def _cadence_valid(
     if not enabled:
         return not background_times
     minimum = round(float(interval) * 1000)
+    if not _finite(solver_started_at_ms) or not _finite(solver_ended_at_ms):
+        return False
+    solver_duration = float(solver_ended_at_ms) - float(solver_started_at_ms)
+    if solver_duration < 0 or (solver_duration >= minimum and not background_times):
+        return False
     ordered = sorted(background_times)
     return not any(
         right - left < minimum for left, right in pairwise(ordered)
     )
 
 
-def _feedback_transport(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _feedback_transport(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_task_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not path.is_file():
         return [], {
             "journal_present": False,
@@ -191,7 +217,26 @@ def _feedback_transport(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any
         request_at = request.get("observed_at_unix")
         response_at = response.get("observed_at_unix")
         if (
-            not _finite(request_at)
+            request.get("schema_version") != "sforge_feedback_transport_v1"
+            or response.get("schema_version") != "sforge_feedback_transport_v1"
+            or request.get("run_id") != expected_run_id
+            or response.get("run_id") != expected_run_id
+            or request.get("task_id") != expected_task_id
+            or response.get("task_id") != expected_task_id
+            or any(
+                request.get(field) != response.get(field)
+                for field in ("channel", "operation")
+            )
+            or not str(request.get("channel") or "")
+            or not str(request.get("operation") or "")
+            or (
+                request.get("subject_id") is not None
+                and request.get("subject_id") != response.get("subject_id")
+            )
+            or len(str(request.get("payload_sha256") or "")) != 64
+            or len(str(response.get("payload_sha256") or "")) != 64
+            or not str(response.get("status") or "")
+            or not _finite(request_at)
             or not _finite(response_at)
             or float(response_at) < float(request_at)
             or int(response.get("sequence") or 0) <= int(request.get("sequence") or 0)
@@ -347,10 +392,14 @@ def build_benchmark_runtime_integrity_attestation(
         submissions,
         active_evaluation=active_evaluation,
         background_evaluation=background_evaluation,
+        solver_started_at_ms=_milliseconds(solver_started),
+        solver_ended_at_ms=_milliseconds(solver_ended),
     )
 
     deliveries, transport = _feedback_transport(
-        evidence_root / "feedback-transport.jsonl"
+        evidence_root / "feedback-transport.jsonl",
+        expected_run_id=run_id,
+        expected_task_id=task_id,
     )
     grading_complete = (
         grading.get("status") == "complete"
@@ -602,6 +651,8 @@ def benchmark_runtime_integrity_failures(
                 if isinstance(background_evaluation, Mapping)
                 else {}
             ),
+            solver_started_at_ms=protocol.get("solver_started_at_ms"),
+            solver_ended_at_ms=protocol.get("solver_ended_at_ms"),
         )
     ):
         failures.append("benchmark_integrity_submission_cadence_invalid")
