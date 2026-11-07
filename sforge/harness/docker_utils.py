@@ -29,7 +29,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 from docker.models.containers import Container
 from docker.utils import split_command
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -119,6 +119,10 @@ _EXEC_SHUTDOWN_GRACE = 20
 _EXEC_DRAIN_GRACE = 5
 _EXEC_DAEMON_READ_ATTEMPTS = 3
 _EXEC_DAEMON_RETRY_DELAY = 0.25
+# A snapshot owner may temporarily freeze the entire container. This is a
+# cleanup allowance, not a renewed command timeout. All closeout operations
+# share one deadline, including exception cleanup; none may unpause the owner.
+_EXEC_PAUSE_RECOVERY_GRACE = 60
 _EXEC_SUPERVISOR = r"""
 control=$1; grace=$2; drain=$3; argv_prefix=$4
 [[ -d "$control" && -p "$control/hold" ]] || exit 125
@@ -218,6 +222,9 @@ def _exec_run(
     On timeout/cancellation, ask the in-container supervisor to terminate its
     group, allow shutdown output, then escalate. An unconfirmed stop or stream
     failure raises instead of exposing a partial output as a completed result.
+    Temporary snapshot pauses share a finite recovery window across stop and
+    receipt operations. The snapshot owner must resume the container; this
+    function neither renews the command timeout nor resumes another owner.
     """
     start = time.monotonic()
     if shutdown_event is not None and shutdown_event.is_set():
@@ -244,12 +251,74 @@ def _exec_run(
     }
     options["environment"] = exec_environment
     control_options = {"user": user} if user else {}
+    incarnation = container.client.api.inspect_container(container.id)
+    started_at = incarnation.get("State", {}).get("StartedAt")
+    restart_count = incarnation.get("RestartCount")
+    pause_deadline = None
+    pause_wait_seconds = 0.0
 
-    def control_command(script):
-        result = container.exec_run(
-            ["/bin/bash", "-c", script, "sforge-exec-control", control],
-            **control_options,
-        )
+    def wait_unpaused(*, rejected=False):
+        """Wait for this incarnation only, within one closeout recovery window."""
+        nonlocal pause_deadline, pause_wait_seconds
+        began = time.monotonic()
+        observed_pause = rejected
+        try:
+            while True:
+                state = container.client.api.inspect_container(container.id)
+                runtime = state.get("State", {})
+                if (
+                    state.get("Id") != incarnation.get("Id")
+                    or state.get("Id") != container.id
+                    or not started_at
+                    or runtime.get("StartedAt") != started_at
+                    or state.get("RestartCount") != restart_count
+                    or not runtime.get("Running")
+                ):
+                    raise RuntimeError(
+                        "Docker exec container incarnation changed during closeout"
+                    )
+                paused = runtime.get("Paused") is True
+                observed_pause = observed_pause or paused
+                if paused or rejected:
+                    if pause_deadline is None:
+                        pause_deadline = began + _EXEC_PAUSE_RECOVERY_GRACE
+                    if time.monotonic() >= pause_deadline:
+                        raise RuntimeError(
+                            "Docker exec pause recovery expired; shutdown unconfirmed"
+                        )
+                if not paused:
+                    return
+                time.sleep(min(0.05, max(0, pause_deadline - time.monotonic())))
+        finally:
+            # Exclude snapshot waiting from the process-group shutdown grace,
+            # while leaving the original solver deadline untouched.
+            if observed_pause:
+                pause_wait_seconds += time.monotonic() - began
+
+    def control_command(script, *, recover_pause=False):
+        while True:
+            try:
+                result = container.exec_run(
+                    ["/bin/bash", "-c", script, "sforge-exec-control", control],
+                    **control_options,
+                )
+                break
+            except APIError as exc:
+                # Do not turn unrelated conflicts into retryable errors. The
+                # fresh inspect also fences restart/name reuse. The owner may
+                # already have resumed between Docker's rejection and inspect.
+                expected = (
+                    f"Container {container.id} is paused, "
+                    "unpause the container before exec"
+                )
+                if (
+                    not recover_pause
+                    or exc.status_code != 409
+                    or exc.explanation != expected
+                ):
+                    raise
+                wait_unpaused(rejected=True)
+                time.sleep(0.01)  # Bound repeated reject/resume races too.
         if result.exit_code != 0:
             raise RuntimeError("Docker exec control operation failed")
         return result.output
@@ -270,7 +339,7 @@ def _exec_run(
     def request_stop():
         nonlocal stop_requested
         if not stop_requested:
-            control_command(': > "$1/stop"')
+            control_command(': > "$1/stop"', recover_pause=True)
             stop_requested = True
 
     def inspect():
@@ -299,7 +368,7 @@ def _exec_run(
 
     def read_shutdown_receipt():
         receipt = retry_daemon_read(
-            lambda: control_command('cat -- "$1/settled"'),
+            lambda: control_command('cat -- "$1/settled"', recover_pause=True),
             "reading the exec shutdown receipt",
         )
         try:
@@ -311,7 +380,14 @@ def _exec_run(
 
     def wait_stopped():
         limit = time.monotonic() + _EXEC_SHUTDOWN_GRACE + _EXEC_DRAIN_GRACE
+        pause_at_start = pause_wait_seconds
+
+        def remaining():
+            # Receipt recovery can discover another pause after exec_inspect.
+            return max(0, limit + pause_wait_seconds - pause_at_start - time.monotonic())
+
         while True:
+            wait_unpaused()
             try:
                 state = retry_daemon_read(inspect, "inspecting exec completion")
             except NotFound as missing:
@@ -323,7 +399,7 @@ def _exec_run(
                 try:
                     exit_code = read_shutdown_receipt()
                 except RuntimeError:
-                    if time.monotonic() >= limit:
+                    if not remaining():
                         raise RuntimeError(
                             "Docker exec metadata disappeared before shutdown "
                             "could be confirmed"
@@ -331,7 +407,7 @@ def _exec_run(
                     time.sleep(0.05)
                     continue
                 if thread is not None:
-                    thread.join(max(0, limit - time.monotonic()))
+                    thread.join(remaining())
                 if thread is not None and thread.is_alive():
                     raise RuntimeError(
                         "Docker exec stopped but output stream did not drain"
@@ -339,13 +415,13 @@ def _exec_run(
                 return {"Running": False, "ExitCode": exit_code}
             if not state["Running"] and state.get("ExitCode") is not None:
                 if thread is not None:
-                    thread.join(max(0, limit - time.monotonic()))
+                    thread.join(remaining())
                 if thread is not None and thread.is_alive():
                     raise RuntimeError(
                         "Docker exec stopped but output stream did not drain"
                     )
                 return state
-            if time.monotonic() >= limit:
+            if not remaining():
                 raise RuntimeError("Docker exec stop could not be confirmed")
             time.sleep(0.05)
 
