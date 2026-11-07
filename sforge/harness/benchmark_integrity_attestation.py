@@ -96,7 +96,7 @@ def _cadence_valid(
 
     active_times: list[int] = []
     background_times: list[int] = []
-    background_completed: dict[int, int] = {}
+    background_completed: list[int] = []
     active_rounds: list[int] = []
     background_rounds: list[int] = []
     for item in submissions:
@@ -113,7 +113,7 @@ def _cadence_valid(
             completed = item.get("evaluation_completed_at_ms")
             if not _finite(completed):
                 return False
-            background_completed[round(float(captured))] = round(float(completed))
+            background_completed.append(round(float(completed)))
             suffix = round_id.removeprefix("auto-")
             target = background_rounds
         else:
@@ -122,9 +122,9 @@ def _cadence_valid(
             return False
         target.append(int(suffix))
 
-    if sorted(active_rounds) != list(range(1, len(active_rounds) + 1)):
+    if active_rounds != list(range(1, len(active_rounds) + 1)):
         return False
-    if sorted(background_rounds) != list(range(1, len(background_rounds) + 1)):
+    if background_rounds != list(range(1, len(background_rounds) + 1)):
         return False
 
     maximum = active_evaluation.get("max_submissions")
@@ -140,8 +140,7 @@ def _cadence_valid(
         if not _finite(cooldown):
             return False
         minimum = round(float(cooldown) * 1000)
-        ordered = sorted(active_times)
-        if any(right - left < minimum for left, right in pairwise(ordered)):
+        if any(right - left < minimum for left, right in pairwise(active_times)):
             return False
 
     enabled = background_evaluation.get("enabled")
@@ -162,26 +161,25 @@ def _cadence_valid(
     solver_duration = solver_end - solver_start
     if solver_duration < 0 or (solver_duration >= minimum and not background_times):
         return False
-    ordered = sorted(background_times)
-    if not ordered:
+    if not background_times:
         return True
     # Extraction and transport add bounded jitter around the configured wake
     # interval.  Back-pressure may defer a snapshot until the previous grading
     # completes, but it must not silently stop the periodic evaluator.
     tolerance = min(60_000, max(1_000, round(minimum * 0.1)))
-    first = ordered[0]
+    first = background_times[0]
     if not (
         solver_start + minimum - tolerance
         <= first
         <= solver_start + minimum + tolerance
     ):
         return False
-    for left, right in pairwise(ordered):
+    for index, (left, right) in enumerate(pairwise(background_times)):
         if right < left + minimum:
             return False
-        if right > background_completed[left] + minimum + tolerance:
+        if right > background_completed[index] + minimum + tolerance:
             return False
-    return solver_end <= background_completed[ordered[-1]] + minimum + tolerance
+    return solver_end <= background_completed[-1] + minimum + tolerance
 
 
 def _feedback_transport(
