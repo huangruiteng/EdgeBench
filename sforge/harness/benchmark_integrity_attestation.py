@@ -87,7 +87,11 @@ def _feedback_transport(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any
     if not path.is_file():
         return [], {
             "journal_present": False,
-            "journal_valid": False,
+            # The recorder creates the journal lazily on the first active-feedback
+            # request.  A missing file therefore proves an unused channel, not a
+            # damaged transcript.  Keep presence separate so consumers can still
+            # distinguish the two cases.
+            "journal_valid": True,
             "request_count": 0,
             "response_ack_count": 0,
             "journal_sha256": None,
@@ -462,13 +466,16 @@ def benchmark_runtime_integrity_failures(
     if not isinstance(transport, Mapping):
         failures.append("benchmark_integrity_feedback_transport_missing")
     else:
-        if transport.get("journal_present") is not True:
-            failures.append("benchmark_integrity_feedback_journal_missing")
         if transport.get("journal_valid") is not True:
             failures.append("benchmark_integrity_feedback_journal_invalid")
         for field in ("request_count", "response_ack_count"):
             if not _finite(transport.get(field)):
                 failures.append(f"benchmark_integrity_feedback_{field}_invalid")
+        if transport.get("journal_present") is not True and (
+            transport.get("request_count") != 0
+            or transport.get("response_ack_count") != 0
+        ):
+            failures.append("benchmark_integrity_feedback_journal_missing")
     public_boundary = value.get("public_boundary")
     if (
         not isinstance(public_boundary, Mapping)

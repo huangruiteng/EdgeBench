@@ -19,7 +19,7 @@ def _write(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
 
 
-def _fixture(tmp_path: Path):
+def _fixture(tmp_path: Path, *, with_active_feedback: bool = True):
     key = tmp_path / "attestation.key"
     key.write_bytes(b"test-only-runtime-attestation-key-32-bytes")
     os.chmod(key, 0o600)
@@ -158,14 +158,26 @@ def _fixture(tmp_path: Path):
             "payload_sha256": "c" * 64,
         },
     ]
-    (root / "feedback-transport.jsonl").write_text(
-        "".join(json.dumps(item) + "\n" for item in transport_records),
-        encoding="utf-8",
-    )
+    if with_active_feedback:
+        (root / "feedback-transport.jsonl").write_text(
+            "".join(json.dumps(item) + "\n" for item in transport_records),
+            encoding="utf-8",
+        )
     benchmark_integrity = write_benchmark_runtime_integrity_attestation(
         records=recorder.records,
         evidence_root=root,
     )
+    evidence_files = {
+        "solver_execution.json": root / "solver_execution.json",
+        "grading_status.json": root / "grading_status.json",
+        "run_history.json": root / "run_history.json",
+        "worker-profile.json": root / "worker-profile.json",
+        benchmark_integrity.name: benchmark_integrity,
+    }
+    if with_active_feedback:
+        evidence_files["feedback-transport.jsonl"] = (
+            root / "feedback-transport.jsonl"
+        )
     recorder.record(
         "terminal",
         "complete",
@@ -185,14 +197,7 @@ def _fixture(tmp_path: Path):
                 "best_pass_rate": 0.5,
             },
         },
-        evidence_files={
-            "solver_execution.json": root / "solver_execution.json",
-            "grading_status.json": root / "grading_status.json",
-            "run_history.json": root / "run_history.json",
-            "worker-profile.json": root / "worker-profile.json",
-            "feedback-transport.jsonl": root / "feedback-transport.jsonl",
-            benchmark_integrity.name: benchmark_integrity,
-        },
+        evidence_files=evidence_files,
     )
     policy = {
         "schema_version": POLICY_SCHEMA_VERSION,
@@ -231,6 +236,26 @@ def test_qualifies_complete_signed_runtime_without_analyst_backfill(tmp_path):
         "evaluation_drain_seconds": 12.5,
     }
     assert receipt["public_boundary"]["analyst_backfill_used"] is False
+
+
+def test_qualifies_when_active_feedback_channel_was_unused(tmp_path):
+    fixture = _fixture(tmp_path, with_active_feedback=False)
+
+    receipt = _qualify(fixture)
+
+    assert receipt["runtime_qualified"] is True
+    assert receipt["benchmark_integrity_qualified"] is True
+    assert receipt["benchmark_integrity_blockers"] == []
+    integrity = json.loads(
+        (fixture[1] / "benchmark-runtime-integrity-attestation.json").read_text()
+    )
+    assert integrity["feedback_transport"] == {
+        "journal_present": False,
+        "journal_valid": True,
+        "request_count": 0,
+        "response_ack_count": 0,
+        "journal_sha256": None,
+    }
 
 
 def test_policy_mismatch_fails_closed(tmp_path):
