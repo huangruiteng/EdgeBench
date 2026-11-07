@@ -31,6 +31,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from sforge.harness.benchmark_integrity_attestation import (
+    benchmark_runtime_integrity_failures,
+)
 from sforge.harness.runtime_attestation import verify_runtime_attestation
 
 POLICY_SCHEMA_VERSION = "sforge_runtime_qualification_policy_v1"
@@ -42,6 +45,7 @@ _EVIDENCE_FILES = {
     "run_history": "run_history.json",
     "game_history": "game_history.json",
     "worker_profile": "worker-profile.json",
+    "benchmark_integrity": "benchmark-runtime-integrity-attestation.json",
 }
 
 
@@ -242,6 +246,26 @@ def qualify_runtime_attestation(
             failures=failures,
         )
 
+    benchmark_integrity_failures: list[str] = []
+    benchmark_integrity = _load_signed_evidence(
+        evidence_root=evidence_root,
+        signed_digests=signed_digests,
+        alias="benchmark_integrity",
+        failures=benchmark_integrity_failures,
+    )
+    if benchmark_integrity is not None:
+        benchmark_integrity_failures.extend(
+            benchmark_runtime_integrity_failures(
+                benchmark_integrity,
+                expected_run_id=expected_run_id,
+                expected_task_id=expected_task_id,
+                expected_source_revision=expected_source_revision,
+            )
+        )
+    benchmark_integrity_failures = list(
+        dict.fromkeys(benchmark_integrity_failures)
+    )
+
     worker_profile = evidence["worker_profile"] or {}
     failures.extend(
         _subset_failures(
@@ -336,6 +360,7 @@ def qualify_runtime_attestation(
         "ok": True,
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "runtime_qualified": not failures,
+        "benchmark_integrity_qualified": not benchmark_integrity_failures,
         "classification": (
             "runtime_integrity_qualified" if not failures
             else "runtime_integrity_not_qualified"
@@ -374,6 +399,7 @@ def qualify_runtime_attestation(
                 "timing" in item or "seconds" in item
                 for item in failures
             ),
+            "benchmark_integrity_attested": not benchmark_integrity_failures,
         },
         "timing": {
             "solver_started_at_unix": solver_started,
@@ -382,6 +408,7 @@ def qualify_runtime_attestation(
             "evaluation_drain_seconds": grading.get("elapsed_seconds"),
         },
         "blockers": failures,
+        "benchmark_integrity_blockers": benchmark_integrity_failures,
         "public_boundary": {
             "raw_evidence_included": False,
             "input_paths_included": False,

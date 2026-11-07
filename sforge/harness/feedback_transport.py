@@ -119,22 +119,23 @@ class FeedbackTransportRecorder:
         payload: Any,
         status: str,
         subject_id: str | None = None,
+        subject_status: str | None = None,
     ) -> None:
-        self._append(
-            self._path(run_id, task_id),
-            {
-                "exchange_id": exchange_id,
-                "record_kind": "response",
-                "observed_at_unix": time.time(),
-                "run_id": run_id,
-                "task_id": task_id,
-                "channel": channel,
-                "operation": operation,
-                "subject_id": subject_id,
-                "status": status,
-                "payload_sha256": payload_sha256(payload),
-            },
-        )
+        record = {
+            "exchange_id": exchange_id,
+            "record_kind": "response",
+            "observed_at_unix": time.time(),
+            "run_id": run_id,
+            "task_id": task_id,
+            "channel": channel,
+            "operation": operation,
+            "subject_id": subject_id,
+            "status": status,
+            "payload_sha256": payload_sha256(payload),
+        }
+        if subject_status is not None:
+            record["subject_status"] = subject_status
+        self._append(self._path(run_id, task_id), record)
 
 
 __all__ = [

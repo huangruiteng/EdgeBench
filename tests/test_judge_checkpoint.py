@@ -307,7 +307,14 @@ def test_preserves_old_selected_archive_and_fresh_result_identity(service):
     assert {e["submission_id"] for e in old["entries"]}.isdisjoint(
         e["submission_id"] for e in new["entries"]
     )
-    for e in new["entries"]:
+    for source_entry, e in zip(old["entries"], new["entries"]):
+        for key in (
+            "submitted_at",
+            "evaluation_started_at",
+            "evaluation_completed_at",
+            "archive_sha256",
+        ):
+            assert e[key] == source_entry[key]
         assert client.get(
             "/api/v1/result/" + e["submission_id"], params={"token": new_token},
         ).json()["report"][
@@ -371,6 +378,8 @@ def test_restore_preserves_each_archive_receipt_with_new_lookup_ids(service, leg
         for sid in original:
             state.submissions[sid].pop("archive_sha256")
             state.submissions[sid].pop("archive_bytes")
+        for entry in state.run_history["source/fixture"]:
+            entry.pop("archive_sha256")
     point = capture(state, client, token)
     response = restore(state, client, point)
     assert response.status_code == 200, response.text

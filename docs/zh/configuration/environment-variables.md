@@ -83,6 +83,11 @@ API Base URL，并且只接受该 Work 容器 IP 的请求。网关用真实模�
 主动与后台评测协议，以及终态评分耗时。密钥和密钥路径不会进入 Work／Judge 容器，
 也不会写入运行配置。
 
+终态采集还会写入 `benchmark-runtime-integrity-attestation.json`。该
+`benchmark_runtime_integrity_attestation_v0` 投影只保留 runner 实际观测到的
+Docker 隔离、按运行隔离的评测边界、逐提交评测时间、反馈传输摘要和评分排空时间；
+终态 HMAC 记录会签住该文件摘要，因此后续分析不能补写缺失边界或时间字段。
+
 密钥应放在日志目录之外，并只交给可信分析环境。密钥缺失、权限过宽、源码版本缺失、
 记录被修改或恢复时协议不一致都会失败关闭；没有当场生成记录的历史运行不能事后补签。
 
@@ -94,6 +99,11 @@ sforge verify-attestation \
   --expected-run-id <run> --expected-task-id <task> \
   --expected-source-revision <commit>
 ```
+
+同时要求底层运行资格和完整 benchmark integrity 时，使用
+`sforge qualify-attestation --require-qualified --require-benchmark-integrity
+...`。缺少新投影的历史运行仍保留原 runtime 资格，但会明确无法通过 benchmark
+integrity 要求。
 :::
 
 ## Judge 变量
