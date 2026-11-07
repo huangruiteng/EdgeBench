@@ -21,6 +21,7 @@ import json
 import math
 import os
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,7 @@ def _cadence_valid(
             return False
         minimum = round(float(cooldown) * 1000)
         ordered = sorted(active_times)
-        if any(right - left < minimum for left, right in zip(ordered, ordered[1:])):
+        if any(right - left < minimum for left, right in pairwise(ordered)):
             return False
 
     enabled = background_evaluation.get("enabled")
@@ -135,7 +136,7 @@ def _cadence_valid(
     minimum = round(float(interval) * 1000)
     ordered = sorted(background_times)
     return not any(
-        right - left < minimum for left, right in zip(ordered, ordered[1:])
+        right - left < minimum for left, right in pairwise(ordered)
     )
 
 
