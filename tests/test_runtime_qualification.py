@@ -317,6 +317,55 @@ def test_rejects_long_background_enabled_run_without_auto_submission(tmp_path):
     )
 
 
+def test_rejects_background_cadence_that_stops_after_first_submission(tmp_path):
+    now = time.time()
+    entry = {
+        "type": "submission",
+        "status": "completed",
+        "submission_id": "submission-1",
+        "task_id": "case-1",
+        "round": "auto-1",
+        "submitted_at": now + 300,
+        "evaluation_started_at": now + 300.1,
+        "evaluation_completed_at": now + 301,
+        "archive_sha256": "a" * 64,
+    }
+    receipt = _qualify(_fixture(
+        tmp_path,
+        history_entries=[entry],
+        solver_runtime_seconds=1000,
+    ))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_submission_cadence_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_qualifies_continuous_background_cadence_within_jitter(tmp_path):
+    now = time.time()
+    entries = [{
+        "type": "submission",
+        "status": "completed",
+        "submission_id": f"submission-{index}",
+        "task_id": "case-1",
+        "round": f"auto-{index}",
+        "submitted_at": now + offset,
+        "evaluation_started_at": now + offset + 0.1,
+        "evaluation_completed_at": now + offset + 1,
+        "archive_sha256": f"{index:x}" * 64,
+    } for index, offset in enumerate((300, 601, 902), 1)]
+
+    receipt = _qualify(_fixture(
+        tmp_path,
+        history_entries=entries,
+        solver_runtime_seconds=1000,
+    ))
+
+    assert receipt["benchmark_integrity_qualified"] is True
+    assert receipt["benchmark_integrity_blockers"] == []
+
+
 def test_rejects_noncontiguous_submission_round_history(tmp_path):
     now = time.time() + 0.1
     entry = {

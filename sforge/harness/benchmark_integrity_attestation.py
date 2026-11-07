@@ -96,6 +96,7 @@ def _cadence_valid(
 
     active_times: list[int] = []
     background_times: list[int] = []
+    background_completed: dict[int, int] = {}
     active_rounds: list[int] = []
     background_rounds: list[int] = []
     for item in submissions:
@@ -109,6 +110,10 @@ def _cadence_valid(
             target = active_rounds
         elif round_id.startswith("auto-"):
             background_times.append(round(float(captured)))
+            completed = item.get("evaluation_completed_at_ms")
+            if not _finite(completed):
+                return False
+            background_completed[round(float(captured))] = round(float(completed))
             suffix = round_id.removeprefix("auto-")
             target = background_rounds
         else:
@@ -152,13 +157,31 @@ def _cadence_valid(
     minimum = round(float(interval) * 1000)
     if not _finite(solver_started_at_ms) or not _finite(solver_ended_at_ms):
         return False
-    solver_duration = float(solver_ended_at_ms) - float(solver_started_at_ms)
+    solver_start = round(float(solver_started_at_ms))
+    solver_end = round(float(solver_ended_at_ms))
+    solver_duration = solver_end - solver_start
     if solver_duration < 0 or (solver_duration >= minimum and not background_times):
         return False
     ordered = sorted(background_times)
-    return not any(
-        right - left < minimum for left, right in pairwise(ordered)
-    )
+    if not ordered:
+        return True
+    # Extraction and transport add bounded jitter around the configured wake
+    # interval.  Back-pressure may defer a snapshot until the previous grading
+    # completes, but it must not silently stop the periodic evaluator.
+    tolerance = min(60_000, max(1_000, round(minimum * 0.1)))
+    first = ordered[0]
+    if not (
+        solver_start + minimum - tolerance
+        <= first
+        <= solver_start + minimum + tolerance
+    ):
+        return False
+    for left, right in pairwise(ordered):
+        if right < left + minimum:
+            return False
+        if right > background_completed[left] + minimum + tolerance:
+            return False
+    return solver_end <= background_completed[ordered[-1]] + minimum + tolerance
 
 
 def _feedback_transport(
