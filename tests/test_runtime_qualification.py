@@ -358,6 +358,7 @@ def test_qualifies_continuous_background_cadence_within_jitter(tmp_path):
 
     receipt = _qualify(_fixture(
         tmp_path,
+        with_active_feedback=False,
         history_entries=entries,
         solver_runtime_seconds=1000,
     ))
@@ -379,6 +380,33 @@ def test_rejects_round_numbers_that_disagree_with_submission_chronology(tmp_path
         "evaluation_completed_at": now + offset + 1,
         "archive_sha256": f"{index:x}" * 64,
     } for index, offset in enumerate((600, 300, 900), 1)]
+
+    receipt = _qualify(_fixture(
+        tmp_path,
+        history_entries=entries,
+        solver_runtime_seconds=1000,
+    ))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_submission_cadence_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_rejects_background_capture_before_previous_evaluation_completes(tmp_path):
+    now = time.time()
+    completion_offsets = (800, 801, 901)
+    entries = [{
+        "type": "submission",
+        "status": "completed",
+        "submission_id": f"submission-{index}",
+        "task_id": "case-1",
+        "round": f"auto-{index}",
+        "submitted_at": now + offset,
+        "evaluation_started_at": now + offset + 0.1,
+        "evaluation_completed_at": now + completion_offsets[index - 1],
+        "archive_sha256": f"{index:x}" * 64,
+    } for index, offset in enumerate((300, 600, 900), 1)]
 
     receipt = _qualify(_fixture(
         tmp_path,
@@ -506,6 +534,109 @@ def test_rejects_feedback_response_with_mismatched_request_identity(tmp_path):
     assert "benchmark_integrity_feedback_journal_invalid" in (
         receipt["benchmark_integrity_blockers"]
     )
+
+
+def test_rejects_active_result_request_without_submission_identity(tmp_path):
+    observed = time.time()
+    records = [
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 1,
+            "exchange_id": "exchange-1",
+            "record_kind": "request",
+            "observed_at_unix": observed,
+            "run_id": "run-1",
+            "task_id": "case-1",
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": None,
+            "payload_sha256": "b" * 64,
+        },
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 2,
+            "exchange_id": "exchange-1",
+            "record_kind": "response",
+            "observed_at_unix": observed + 0.1,
+            "run_id": "run-1",
+            "task_id": "case-1",
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": "submission-1",
+            "subject_status": "completed",
+            "status": "delivered",
+            "payload_sha256": "c" * 64,
+        },
+    ]
+
+    receipt = _qualify(_fixture(tmp_path, feedback_records=records))
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_feedback_journal_invalid" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+
+
+def test_rejects_active_feedback_bound_to_background_submission(tmp_path):
+    now = time.time()
+    entries = [{
+        "type": "submission",
+        "status": "completed",
+        "submission_id": f"auto-submission-{index}",
+        "task_id": "case-1",
+        "round": f"auto-{index}",
+        "submitted_at": now + offset,
+        "evaluation_started_at": now + offset + 0.1,
+        "evaluation_completed_at": now + offset + 1,
+        "archive_sha256": f"{index:x}" * 64,
+    } for index, offset in enumerate((300, 601, 902), 1)]
+    feedback_records = [
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 1,
+            "exchange_id": "exchange-1",
+            "record_kind": "request",
+            "observed_at_unix": now + 302,
+            "run_id": "run-1",
+            "task_id": "case-1",
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": "auto-submission-1",
+            "payload_sha256": "b" * 64,
+        },
+        {
+            "schema_version": "sforge_feedback_transport_v1",
+            "sequence": 2,
+            "exchange_id": "exchange-1",
+            "record_kind": "response",
+            "observed_at_unix": now + 302.1,
+            "run_id": "run-1",
+            "task_id": "case-1",
+            "channel": "active_submission",
+            "operation": "result",
+            "subject_id": "auto-submission-1",
+            "subject_status": "completed",
+            "status": "delivered",
+            "payload_sha256": "c" * 64,
+        },
+    ]
+
+    fixture = _fixture(
+        tmp_path,
+        history_entries=entries,
+        feedback_records=feedback_records,
+        solver_runtime_seconds=1000,
+    )
+    receipt = _qualify(fixture)
+
+    assert receipt["benchmark_integrity_qualified"] is False
+    assert "benchmark_integrity_feedback_delivery_history_unbound" in (
+        receipt["benchmark_integrity_blockers"]
+    )
+    integrity = json.loads(
+        (fixture[1] / "benchmark-runtime-integrity-attestation.json").read_text()
+    )
+    assert integrity["official_feedback_blinded"] is False
 
 
 def test_policy_mismatch_fails_closed(tmp_path):

@@ -177,9 +177,42 @@ def _cadence_valid(
     for index, (left, right) in enumerate(pairwise(background_times)):
         if right < left + minimum:
             return False
+        if right < background_completed[index]:
+            return False
         if right > background_completed[index] + minimum + tolerance:
             return False
     return solver_end <= background_completed[-1] + minimum + tolerance
+
+
+def _feedback_history_bound(
+    submissions: Sequence[Mapping[str, Any]],
+    deliveries: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Bind delivered active feedback to unique agent submission identities."""
+
+    submission_ids: set[str] = set()
+    active_submission_ids: set[str] = set()
+    for item in submissions:
+        submission_id = str(item.get("submission_id") or "")
+        round_id = str(item.get("round_id") or "")
+        if not submission_id or submission_id in submission_ids:
+            return False
+        submission_ids.add(submission_id)
+        if round_id.startswith("agent-"):
+            active_submission_ids.add(submission_id)
+
+    delivered_ids: set[str] = set()
+    for item in deliveries:
+        submission_id = str(item.get("submission_id") or "")
+        if (
+            item.get("channel_id") != "active_submission_result"
+            or not submission_id
+            or submission_id in delivered_ids
+            or submission_id not in active_submission_ids
+        ):
+            return False
+        delivered_ids.add(submission_id)
+    return True
 
 
 def _feedback_transport(
@@ -237,6 +270,12 @@ def _feedback_transport(
         response = matched_responses[0]
         request_at = request.get("observed_at_unix")
         response_at = response.get("observed_at_unix")
+        request_subject = request.get("subject_id")
+        response_subject = response.get("subject_id")
+        subject_required = (
+            request.get("channel") == "active_submission"
+            and request.get("operation") == "result"
+        )
         if (
             request.get("schema_version") != "sforge_feedback_transport_v1"
             or response.get("schema_version") != "sforge_feedback_transport_v1"
@@ -251,8 +290,16 @@ def _feedback_transport(
             or not str(request.get("channel") or "")
             or not str(request.get("operation") or "")
             or (
-                request.get("subject_id") is not None
-                and request.get("subject_id") != response.get("subject_id")
+                subject_required
+                and (
+                    not str(request_subject or "")
+                    or request_subject != response_subject
+                )
+            )
+            or (
+                not subject_required
+                and request_subject is not None
+                and request_subject != response_subject
             )
             or len(str(request.get("payload_sha256") or "")) != 64
             or len(str(response.get("payload_sha256") or "")) != 64
@@ -422,6 +469,7 @@ def build_benchmark_runtime_integrity_attestation(
         expected_run_id=run_id,
         expected_task_id=task_id,
     )
+    feedback_history_bound = _feedback_history_bound(submissions, deliveries)
     grading_complete = (
         grading.get("status") == "complete"
         and grading.get("pending_submissions") == 0
@@ -484,6 +532,7 @@ def build_benchmark_runtime_integrity_attestation(
         and grading_complete
         and history_digest_matches
         and transport["journal_valid"]
+        and feedback_history_bound
     )
 
     return {
@@ -524,8 +573,9 @@ def build_benchmark_runtime_integrity_attestation(
             evaluation_boundary.get(
                 "background_results_absent_from_solver_history"
             )
-            is True
+            is True and feedback_history_bound
         ),
+        "feedback_delivery_history_bound": feedback_history_bound,
         "evaluation_protocol_enforced": protocol_enforced,
         "evaluation_log_complete": (
             grading_complete
@@ -685,6 +735,14 @@ def benchmark_runtime_integrity_failures(
         for item in cadence_submissions
     ):
         failures.append("benchmark_integrity_evaluation_after_drain")
+
+    deliveries = protocol.get("deliveries")
+    if (
+        not isinstance(deliveries, list)
+        or value.get("feedback_delivery_history_bound") is not True
+        or not _feedback_history_bound(cadence_submissions, deliveries)
+    ):
+        failures.append("benchmark_integrity_feedback_delivery_history_unbound")
 
     transport = value.get("feedback_transport")
     if not isinstance(transport, Mapping):
