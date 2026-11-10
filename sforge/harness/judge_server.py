@@ -694,6 +694,13 @@ class JudgeState:
             type(config.judge_host_capacity) is not int or config.judge_host_capacity < 1
         ):
             raise ValueError("judge_host_capacity must be a positive integer or unset")
+        runs = config.judge_isolated_runs
+        if not isinstance(runs, (list, tuple)) or any(not isinstance(r, str) or not r.strip() for r in runs):
+            raise ValueError("Isolated judge runs must be a list of nonempty run IDs")
+        if len(set(runs)) != len(runs) or len(runs) > config.judge_max_concurrent:
+            raise ValueError("Each isolated run requires a unique ID and one configured evaluator")
+        if runs and config.judge_host_capacity is not None and len(runs) > config.judge_host_capacity:
+            raise ValueError("Host judge capacity cannot accommodate all isolated runs")
         self.config = config
         # Synchronous failures release while holding this same admission lock.
         self._admission_lock = threading.RLock()
@@ -705,6 +712,13 @@ class JudgeState:
         self._executor = ThreadPoolExecutor(
             max_workers=config.judge_max_concurrent, thread_name_prefix="sforge-judge"
         )
+        # Divide the pending budget evenly. An overloaded arm cannot borrow a
+        # peer's admission slots or block its evaluator with work already queued.
+        self._run_lanes = {
+            run: (ThreadPoolExecutor(max_workers=1, thread_name_prefix="sforge-arm-judge"),
+                  threading.BoundedSemaphore(1 + config.judge_max_pending // len(runs)))
+            for run in runs
+        }
         self.admin_secret = get_admin_secret(config.log_dir)
         self.feedback_transport = FeedbackTransportRecorder(config.log_dir)
         self.tasks: dict[str, TaskSpec] = {}
@@ -942,6 +956,8 @@ class JudgeState:
                          e2b_sandbox_ttl: int | None = None) -> tuple[dict, ContainerBackend | None, str]:
         if task_id not in self.tasks:
             raise ValueError(f"Unknown task: {task_id}")
+        if self._run_lanes and run_id not in self._run_lanes:
+            raise ValueError("Run has no reserved evaluator")
         backend_override = None
         info = {
             "task_id": task_id,
@@ -1247,14 +1263,24 @@ class JudgeState:
             self._closed = True
         self._reaper_stop.set()
         self._executor.shutdown(wait=True)
+        for executor, _ in self._run_lanes.values():
+            executor.shutdown(wait=True)
         self._reaper_thread.join()
+
+    def _evaluation_lane(self, run_id: str | None):
+        if not self._run_lanes:
+            return self._executor, self._capacity
+        if run_id not in self._run_lanes:
+            raise JudgeCapacityExceeded("Run has no reserved evaluator")
+        return self._run_lanes[run_id]
 
     def _reserve(self, run_id: str | None, task_id: str) -> None:
         limit = self.config.judge_max_outstanding_per_run
         key = (run_id, task_id) if run_id is not None and limit is not None else None
         if key is not None and self._outstanding_by_run.get(key, 0) >= limit:
             raise JudgeCapacityExceeded("Run/task evaluation capacity full; retry this snapshot later")
-        if self._closed or not self._capacity.acquire(blocking=False):
+        _, capacity = self._evaluation_lane(run_id)
+        if self._closed or not capacity.acquire(blocking=False):
             raise JudgeCapacityExceeded("Judge capacity full; retry this snapshot later")
         if key is not None:
             self._outstanding_by_run[key] = self._outstanding_by_run.get(key, 0) + 1
@@ -1268,7 +1294,8 @@ class JudgeState:
                     self._outstanding_by_run[key] = remaining
                 else:
                     del self._outstanding_by_run[key]
-            self._capacity.release()
+            _, capacity = self._evaluation_lane(run_id)
+            capacity.release()
 
     def submit_for_token(self, token: str, archive: bytes, kind: str) -> tuple[str, str, int | None]:
         """Reserve capacity before spending a round or starting its cooldown."""
@@ -1339,7 +1366,8 @@ class JudgeState:
         try:
             self._record_submission(run_id or submission_id, submission_id, task_id,
                                     round_id, None, None, status="queued")
-            self._executor.submit(self._grade_spooled, submission_id, task_id,
+            executor, _ = self._evaluation_lane(run_id)
+            executor.submit(self._grade_spooled, submission_id, task_id,
                                   spool, run_id, round_id, cpu, mem, kind)
         except BaseException as e:
             self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))

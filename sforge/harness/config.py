@@ -111,6 +111,7 @@ class SForgeConfig:
     # Paths
     log_dir: Path = field(default_factory=lambda: LOG_DIR)
     tasks_dir: Path = field(default_factory=lambda: TASKS_DIR)
+    judge_isolated_runs: tuple[str, ...] = ()
 
 
 def load_config(cli_overrides: dict | None = None) -> SForgeConfig:
