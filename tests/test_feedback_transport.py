@@ -49,6 +49,44 @@ def test_feedback_transport_retains_digests_and_order_without_content(tmp_path):
     assert records[0]["observed_at_unix"] <= records[1]["observed_at_unix"]
 
 
+def test_active_feedback_records_typed_agent_only_provenance(tmp_path):
+    recorder = FeedbackTransportRecorder(tmp_path)
+    exchange = recorder.request(
+        run_id="run-1", task_id="case-1", channel="active_submission",
+        operation="history", payload={},
+    )
+    payload = {"entries": [{"round": "agent-1", "submission_id": "sub-1"}],
+               "best_round": "agent-1", "agent_submissions": 1}
+    recorder.response(
+        exchange_id=exchange, run_id="run-1", task_id="case-1",
+        channel="active_submission", operation="history", payload=payload,
+        status="delivered",
+    )
+    records = [json.loads(line) for line in (
+        tmp_path / "runs/run-1/case-1" / JOURNAL_FILE).read_text().splitlines()]
+    assert records[-1]["provenance"] == {
+        "policy": "active_feedback_projection_v1",
+        "visibility_scope": "agent_submissions_only",
+        "source_submission_ids": ["sub-1"],
+    }
+
+
+def test_active_feedback_rejects_background_history_before_delivery(tmp_path):
+    recorder = FeedbackTransportRecorder(tmp_path)
+    exchange = recorder.request(
+        run_id="run-1", task_id="case-1", channel="active_submission",
+        operation="history", payload={},
+    )
+    with pytest.raises(ValueError, match="non-agent evidence"):
+        recorder.response(
+            exchange_id=exchange, run_id="run-1", task_id="case-1",
+            channel="active_submission", operation="history",
+            payload={"entries": [{"round": "auto-1",
+                                   "submission_id": "background-1"}]},
+            status="delivered",
+        )
+
+
 def test_concurrent_feedback_records_keep_unique_monotonic_sequence(tmp_path):
     recorder = FeedbackTransportRecorder(tmp_path)
 
