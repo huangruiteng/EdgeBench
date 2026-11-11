@@ -66,6 +66,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _evidence_digest(path: Path) -> str:
+    """Hash one required evidence file without following an ambiguous path."""
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(f"Required runtime evidence is unavailable: {path}")
+    try:
+        return "sha256:" + _sha256_file(path)
+    except OSError as exc:
+        raise OSError(f"Required runtime evidence is unreadable: {path}") from exc
+
+
 class RuntimeAttestationRecorder:
     """Persist signed runtime observations under a task's log directory."""
 
@@ -133,8 +143,9 @@ class RuntimeAttestationRecorder:
             raise ValueError("Runtime attestation phase and status are required")
         evidence: dict[str, str] = {}
         for name, path in sorted((evidence_files or {}).items()):
-            if path.is_file():
-                evidence[name] = "sha256:" + _sha256_file(path)
+            if not name:
+                raise ValueError("Runtime evidence names must be non-empty")
+            evidence[name] = _evidence_digest(Path(path))
 
         self._sequence += 1
         payload: dict[str, Any] = {
@@ -243,3 +254,31 @@ def verify_runtime_attestation(
         if expected is not None and identity.get(field) != expected:
             raise ValueError(f"Attestation {field} does not match the expected value")
     return records
+
+
+def verify_runtime_attestation_evidence(
+    record: dict[str, Any],
+    evidence_files: dict[str, Path],
+    *,
+    expected_keys: set[str] | None = None,
+) -> dict[str, str]:
+    """Re-read every signed file and require an exact evidence manifest.
+
+    HMAC verification protects the recorded digest.  This readback additionally
+    proves that the retained bytes still match that digest and that callers did
+    not silently omit a required evidence key.
+    """
+    payload = record.get("payload") if isinstance(record, dict) else None
+    signed = payload.get("evidence") if isinstance(payload, dict) else None
+    if not isinstance(signed, dict):
+        raise ValueError("Runtime attestation evidence manifest is missing")
+    required = set(evidence_files) if expected_keys is None else set(expected_keys)
+    if set(evidence_files) != required or set(signed) != required:
+        raise ValueError("Runtime attestation evidence manifest mismatch")
+    observed = {
+        name: _evidence_digest(Path(evidence_files[name]))
+        for name in sorted(required)
+    }
+    if observed != signed:
+        raise ValueError("Runtime attestation evidence digest mismatch")
+    return observed

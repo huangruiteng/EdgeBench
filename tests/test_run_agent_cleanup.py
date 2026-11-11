@@ -284,6 +284,18 @@ def test_interrupt_during_install_returns_interrupted_result(harness):
 def test_success_preserves_result_and_stops_auto_eval(harness, monkeypatch, auto_eval):
     thread_factory = Mock()
     monkeypatch.setattr(runner.threading, "Thread", thread_factory)
+    if auto_eval:
+        results = iter([
+            StreamingExecResult(output="solver-output", elapsed_seconds=2),
+            StreamingExecResult(output="{}"),
+        ])
+
+        def execute(*_args, **kwargs):
+            if kwargs.get("on_chunk") is not None:
+                kwargs["on_chunk"](b"solver-output")
+            return next(results)
+
+        harness.backend.exec_run_with_timeout.side_effect = execute
     result = harness.run(disable_auto_eval=not auto_eval)
     assert result.agent_output == "solver-output"
     assert result.archive == b"synthetic-archive"
