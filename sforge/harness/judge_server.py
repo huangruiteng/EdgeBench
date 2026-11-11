@@ -1047,6 +1047,40 @@ class JudgeState:
                 raise KeyError("Invalid token")
             return dict(info)
 
+    def resolve_feedback_registration(self, token: str) -> dict[str, str]:
+        """Return the stable identity of one host-held feedback registration.
+
+        Registration consumers must not compare a full token snapshot: mutable
+        submission counters can change between otherwise valid reads.  Resolve
+        the opaque relay and its immutable run identity together while holding
+        the token lock instead.  The host already owns ``token``, so it is
+        deliberately absent from the returned, log-safe projection.
+        """
+        with self._tokens_lock:
+            info = self.tokens.get(token)
+            if info is None:
+                raise KeyError("Invalid token")
+            relay_id = info.get("feedback_relay_id")
+            run_id = info.get("run_id")
+            task_id = info.get("task_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (relay_id, run_id, task_id)
+            ):
+                raise KeyError("Feedback registration unavailable")
+            matches = [
+                candidate
+                for candidate, candidate_info in self.tokens.items()
+                if candidate_info.get("feedback_relay_id") == relay_id
+            ]
+            if matches != [token]:
+                raise KeyError("Invalid feedback relay")
+            return {
+                "feedback_relay_id": relay_id,
+                "run_id": run_id,
+                "task_id": task_id,
+            }
+
     def resolve_feedback_relay(self, relay_id: str) -> tuple[str, dict]:
         """Resolve one opaque relay route to its host-held judge authority."""
         with self._tokens_lock:
@@ -1061,11 +1095,7 @@ class JudgeState:
             return token, dict(info)
 
     def feedback_relay_id(self, token: str) -> str:
-        info = self.resolve_token(token)
-        relay_id = info.get("feedback_relay_id")
-        if not isinstance(relay_id, str) or not relay_id:
-            raise KeyError("Feedback relay unavailable")
-        return relay_id
+        return self.resolve_feedback_registration(token)["feedback_relay_id"]
 
     def resolve_game_session(
         self, run_id: str, task_id: str, session_id: str,
@@ -1228,7 +1258,6 @@ class JudgeState:
             "agent_submissions": sum(
                 1 for entry in agent_entries if entry.get("type") == "submission"
             ),
-            "auto_submissions": 0,
             "agent_submission_availability": availability,
             "entries": agent_entries,
         }

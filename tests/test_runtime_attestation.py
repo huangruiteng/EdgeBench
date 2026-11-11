@@ -7,6 +7,7 @@ import pytest
 from sforge.harness.runtime_attestation import (
     RuntimeAttestationRecorder,
     verify_runtime_attestation,
+    verify_runtime_attestation_evidence,
 )
 from sforge.cli import cmd_verify_attestation
 
@@ -70,6 +71,50 @@ def test_tampered_or_truncated_journal_does_not_verify(tmp_path):
 
     with pytest.raises(ValueError, match="digest mismatch|signature mismatch"):
         verify_runtime_attestation(journal, key)
+
+
+def test_missing_named_evidence_fails_before_record_is_appended(tmp_path):
+    key = signing_key(tmp_path)
+    logs = tmp_path / "run"
+    logs.mkdir()
+    recorder = RuntimeAttestationRecorder(
+        logs, key_file=key, runner_source_revision="revision",
+        run_id="run", task_id="case", protocol={},
+    )
+
+    with pytest.raises(FileNotFoundError, match="Required runtime evidence"):
+        recorder.record(
+            "terminal", "complete", {},
+            evidence_files={"required": logs / "missing.json"},
+        )
+
+    assert not (logs / "runtime-attestation.jsonl").exists()
+
+
+def test_evidence_readback_rejects_mutation_and_manifest_drift(tmp_path):
+    key = signing_key(tmp_path)
+    logs = tmp_path / "run"
+    logs.mkdir()
+    evidence = logs / "evidence.json"
+    evidence.write_text('{"status":"complete"}')
+    recorder = RuntimeAttestationRecorder(
+        logs, key_file=key, runner_source_revision="revision",
+        run_id="run", task_id="case", protocol={},
+    )
+    record = recorder.record(
+        "terminal", "complete", {}, evidence_files={"required": evidence},
+    )
+    assert verify_runtime_attestation_evidence(
+        record, {"required": evidence}, expected_keys={"required"},
+    )["required"].startswith("sha256:")
+
+    evidence.write_text('{"status":"rewritten"}')
+    with pytest.raises(ValueError, match="digest mismatch"):
+        verify_runtime_attestation_evidence(
+            record, {"required": evidence}, expected_keys={"required"},
+        )
+    with pytest.raises(ValueError, match="manifest mismatch"):
+        verify_runtime_attestation_evidence(record, {}, expected_keys={"required"})
 
 
 def test_key_permissions_and_run_identity_fail_closed(tmp_path):

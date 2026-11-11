@@ -33,9 +33,11 @@ def harness(tmp_path, monkeypatch):
     }
     state.run_history["sample/example"] = [
         {"type": "submission", "round": "agent-2", "score": 0.4,
-         "pass_rate": 1.0, "status": "completed", "timestamp": 1.0},
+         "submission_id": "agent-submission", "pass_rate": 1.0,
+         "status": "completed", "timestamp": 1.0},
         {"type": "submission", "round": "auto-1", "score": 0.9,
-         "pass_rate": 1.0, "status": "completed", "timestamp": 2.0},
+         "submission_id": "background-submission", "pass_rate": 1.0,
+         "status": "completed", "timestamp": 2.0},
     ]
     monkeypatch.setattr(judge, "JudgeState", lambda config, **kwargs: state)
     app = judge.create_app(state.config)
@@ -87,7 +89,7 @@ def test_history_uses_token_limits_and_preserves_visibility(harness, monkeypatch
             assert data["best_score"] == 0.4
             assert data["best_round"] == "agent-2"
             assert [entry["round"] for entry in data["entries"]] == ["agent-2"]
-            assert data["auto_submissions"] == 0
+            assert "auto_submissions" not in data
             assert data["agent_submission_availability"]["cooldown_remaining_seconds"] == 3501
         assert state.tokens == before
         rejected = client.post("/api/v1/submit", data={"token": "test-token"},

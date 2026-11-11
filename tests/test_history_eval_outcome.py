@@ -74,6 +74,8 @@ def test_completed_history_retains_original_evaluation_outcome(
     availability = agent.pop("agent_submission_availability")
     assert availability["remaining_submissions"] is None
     assert availability["cooldown_remaining_seconds"] == 0
+    assert "auto_submissions" not in agent
+    host.pop("auto_submissions")
     assert host == agent
     entry = host["entries"][0]
     assert entry["timed_out"] is timed_out

@@ -110,6 +110,8 @@ class Backend:
                 raise KeyboardInterrupt
             if self.solver_error is not None:
                 raise self.solver_error
+            if kwargs.get("on_chunk") is not None:
+                kwargs["on_chunk"](b"solver started")
             self.before_solver_return()
             return StreamingExecResult(output="solver done", elapsed_seconds=1,
                                        timed_out=self.solver_timed_out)
@@ -393,7 +395,7 @@ def test_auto_eval_start_failure_preserves_error_and_cleanup(harness, monkeypatc
     monkeypatch.setattr(runner, "threading", thread_api)
     result = harness.run(disable_auto_eval=False)
     assert "synthetic thread" in result.agent_output
-    assert harness.backend.solver_calls == 0
+    assert harness.backend.solver_calls == 1
     assert harness.backend.cleaned_at is not None
 
 

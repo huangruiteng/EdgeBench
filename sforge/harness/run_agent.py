@@ -747,12 +747,16 @@ def _record_terminal_attestation(
                 }
         except (OSError, ValueError):
             evaluation = {"status": "unreadable"}
-    evidence = {
+    evidence_candidates = {
         name: log_dir / name for name in (
             "solver_execution.json", "grading_status.json", "run_history.json",
             "game_history.json", "worker-profile.json", "final_archive.tar.gz",
             "feedback-transport.jsonl",
         )
+    }
+    evidence = {
+        name: path for name, path in evidence_candidates.items()
+        if path.is_file() and not path.is_symlink()
     }
     recorder.record(
         "terminal",
@@ -1190,22 +1194,10 @@ def run_agent(
                 disable_stop_hook=disable_stop_hook,
             )
 
-            # Start host-side auto-eval thread (if enabled)
+            # Arm host-side auto-eval.  The thread starts only after the first
+            # solver output proves that the agent process was dispatched.
             if effective_eval_interval > 0:
                 auto_eval_stop = threading.Event()
-                auto_eval_thread = threading.Thread(
-                    target=_auto_eval_loop,
-                    args=(
-                        backend, handle, task_spec, host_judge_url,
-                        session_token, effective_eval_interval,
-                        auto_eval_stop, logger, log_dir,
-                        admin_secret,
-                    ),
-                    daemon=True,
-                )
-                auto_eval_thread.start()
-                auto_eval_started = True
-                logger.info(f"Host-side auto-eval started (interval={effective_eval_interval}s)")
         elif not disable_stop_hook:
             agent.install_stop_hook(backend, handle, log_dir, logger)
 
@@ -1234,6 +1226,28 @@ def run_agent(
             net_isolation = backend.create_network_isolation(handle, endpoints, logger)
             net_isolation.apply()
 
+        # 5. Write prompt
+        if task_spec.game_mode:
+            prompt = generate_game_prompt(
+                task_spec.work.agent_query,
+                internet=internet,
+                agent_budget_seconds=effective_timeout,
+            )
+        else:
+            prompt = generate_evolve_prompt(
+                task_spec.work.agent_query,
+                submit_paths=task_spec.submit_paths,
+                internet=internet,
+                max_submissions=max_submissions,
+                submission_cooldown=submission_cooldown,
+                agent_budget_seconds=effective_timeout,
+            )
+        prompt_path = "/tmp/agent_prompt.md"
+        local_prompt = log_dir / "agent_prompt.md"
+        local_prompt.write_text(prompt)
+        _install_task_file(backend, handle, local_prompt, PurePosixPath(prompt_path))
+        logger.info(f"Prompt written ({len(prompt)} bytes)")
+
         if runtime_attestation is not None:
             credential_mode = (
                 "host_gateway" if credential_proxy is not None
@@ -1260,30 +1274,8 @@ def run_agent(
                         "gateway_client_ip_restricted": credential_proxy is not None,
                     },
                 },
-                evidence_files={"prompt": log_dir / "agent_prompt.md"},
+                evidence_files={"prompt": local_prompt},
             )
-
-        # 5. Write prompt
-        if task_spec.game_mode:
-            prompt = generate_game_prompt(
-                task_spec.work.agent_query,
-                internet=internet,
-                agent_budget_seconds=effective_timeout,
-            )
-        else:
-            prompt = generate_evolve_prompt(
-                task_spec.work.agent_query,
-                submit_paths=task_spec.submit_paths,
-                internet=internet,
-                max_submissions=max_submissions,
-                submission_cooldown=submission_cooldown,
-                agent_budget_seconds=effective_timeout,
-            )
-        prompt_path = "/tmp/agent_prompt.md"
-        local_prompt = log_dir / "agent_prompt.md"
-        local_prompt.write_text(prompt)
-        _install_task_file(backend, handle, local_prompt, PurePosixPath(prompt_path))
-        logger.info(f"Prompt written ({len(prompt)} bytes)")
 
         # 6. Run agent (with auto-resume on abnormal exit)
         can_resume = not disable_auto_resume and agent.resume_cmd is not None
@@ -1301,7 +1293,50 @@ def run_agent(
         started_at_iso = datetime.fromtimestamp(started_at).strftime("%Y-%m-%dT%H:%M:%S")
         (log_dir / "started_at").write_text(f"{started_at_iso}\n{started_at}\n")
 
-        on_chunk_cb = None
+        agent_started = threading.Event()
+        agent_start_lock = threading.Lock()
+
+        def on_chunk_cb(_chunk: bytes) -> None:
+            nonlocal auto_eval_thread, auto_eval_started
+            if agent_started.is_set():
+                return
+            with agent_start_lock:
+                if agent_started.is_set():
+                    return
+                observed_at = time.time()
+                if runtime_attestation is not None:
+                    runtime_attestation.record(
+                        "agent_started", "started",
+                        {
+                            "started_at_unix": observed_at,
+                            "first_output_observed": True,
+                            "container_id_sha256": hashlib.sha256(
+                                handle.id.encode()
+                            ).hexdigest(),
+                        },
+                        evidence_files={
+                            "prompt": local_prompt,
+                            "solver_execution": log_dir / "solver_execution.json",
+                        },
+                    )
+                if auto_eval_stop is not None:
+                    auto_eval_thread = threading.Thread(
+                        target=_auto_eval_loop,
+                        args=(
+                            backend, handle, task_spec, host_judge_url,
+                            session_token, effective_eval_interval,
+                            auto_eval_stop, logger, log_dir,
+                            admin_secret,
+                        ),
+                        daemon=True,
+                    )
+                    auto_eval_thread.start()
+                    auto_eval_started = True
+                    logger.info(
+                        "Host-side auto-eval started after agent output "
+                        f"(interval={effective_eval_interval}s)"
+                    )
+                agent_started.set()
 
         while remaining_timeout > 0:
             if restored_execution is not None:
@@ -1412,8 +1447,9 @@ def run_agent(
             auto_eval_stop.set()
             # A set event does not cancel an in-flight submit HTTP request.
             # Wait for the producer before interpreting an empty pending set.
-            auto_eval_thread.join(timeout=435)
-            auto_eval_joined = True
+            if auto_eval_thread is not None:
+                auto_eval_thread.join(timeout=435)
+                auto_eval_joined = True
             logger.info("Auto-eval stop requested")
         auto_eval_finished = auto_eval_thread is None or not auto_eval_thread.is_alive()
 

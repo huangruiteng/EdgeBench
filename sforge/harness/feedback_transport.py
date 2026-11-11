@@ -120,6 +120,48 @@ class FeedbackTransportRecorder:
         status: str,
         subject_id: str | None = None,
     ) -> None:
+        provenance: dict[str, Any] | None = None
+        if channel == "active_submission":
+            source_ids: list[str] = []
+            scope = "control_only"
+            if operation == "history" and status == "delivered":
+                if not isinstance(payload, dict):
+                    raise ValueError("Active history payload must be an object")
+                entries = payload.get("entries")
+                if not isinstance(entries, list):
+                    raise ValueError("Active history payload must contain entries")
+                for entry in entries:
+                    if (not isinstance(entry, dict)
+                            or not str(entry.get("round") or "").startswith("agent-")
+                            or not isinstance(entry.get("submission_id"), str)):
+                        raise ValueError("Active history contains non-agent evidence")
+                    source_ids.append(entry["submission_id"])
+                best_round = str(payload.get("best_round") or "")
+                if (best_round and not best_round.startswith("agent-")):
+                    raise ValueError("Active history selects non-agent evidence")
+                if "auto_submissions" in payload:
+                    raise ValueError("Active history exposes background accounting")
+                scope = "agent_submissions_only"
+            elif operation == "result" and status == "delivered":
+                if (not subject_id or not isinstance(payload, dict)
+                        or payload.get("submission_id") != subject_id):
+                    raise ValueError("Active result provenance is invalid")
+                source_ids = [subject_id]
+                scope = "agent_submissions_only"
+            elif operation == "submit" and status == "accepted":
+                if (not subject_id or not isinstance(payload, dict)
+                        or payload.get("submission_id") != subject_id
+                        or not str(payload.get("round_id") or "").startswith("agent-")):
+                    raise ValueError("Active submit provenance is invalid")
+                source_ids = [subject_id]
+                scope = "agent_submissions_only"
+            elif operation not in {"submit", "result", "history"}:
+                raise ValueError("Unknown active feedback operation")
+            provenance = {
+                "policy": "active_feedback_projection_v1",
+                "visibility_scope": scope,
+                "source_submission_ids": source_ids,
+            }
         self._append(
             self._path(run_id, task_id),
             {
@@ -133,6 +175,7 @@ class FeedbackTransportRecorder:
                 "subject_id": subject_id,
                 "status": status,
                 "payload_sha256": payload_sha256(payload),
+                **({"provenance": provenance} if provenance is not None else {}),
             },
         )
 

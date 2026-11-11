@@ -1,4 +1,5 @@
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -12,6 +13,45 @@ from sforge.harness.feedback_transport import (
     FeedbackTransportRecorder,
     payload_sha256,
 )
+
+
+def test_feedback_registration_projects_stable_identity_without_host_token():
+    state = object.__new__(judge_server.JudgeState)
+    state._tokens_lock = threading.RLock()
+    state.tokens = {
+        "host-only-token": {
+            "feedback_relay_id": "opaque-relay",
+            "run_id": "run-1",
+            "task_id": "case-1",
+            "next_agent": 7,
+            "last_agent_submit_at": 123.0,
+        },
+    }
+
+    registration = state.resolve_feedback_registration("host-only-token")
+
+    assert registration == {
+        "feedback_relay_id": "opaque-relay",
+        "run_id": "run-1",
+        "task_id": "case-1",
+    }
+    assert "host-only-token" not in repr(registration)
+
+
+def test_feedback_registration_rejects_an_ambiguous_relay():
+    state = object.__new__(judge_server.JudgeState)
+    state._tokens_lock = threading.RLock()
+    state.tokens = {
+        token: {
+            "feedback_relay_id": "duplicate-relay",
+            "run_id": "run-1",
+            "task_id": task_id,
+        }
+        for token, task_id in (("token-1", "case-1"), ("token-2", "case-2"))
+    }
+
+    with pytest.raises(KeyError, match="Invalid feedback relay"):
+        state.resolve_feedback_registration("token-1")
 
 
 def test_feedback_transport_retains_digests_and_order_without_content(tmp_path):
@@ -47,6 +87,44 @@ def test_feedback_transport_retains_digests_and_order_without_content(tmp_path):
     assert records[0]["payload_sha256"] == payload_sha256(request)
     assert records[1]["payload_sha256"] == payload_sha256(response)
     assert records[0]["observed_at_unix"] <= records[1]["observed_at_unix"]
+
+
+def test_active_feedback_records_typed_agent_only_provenance(tmp_path):
+    recorder = FeedbackTransportRecorder(tmp_path)
+    exchange = recorder.request(
+        run_id="run-1", task_id="case-1", channel="active_submission",
+        operation="history", payload={},
+    )
+    payload = {"entries": [{"round": "agent-1", "submission_id": "sub-1"}],
+               "best_round": "agent-1", "agent_submissions": 1}
+    recorder.response(
+        exchange_id=exchange, run_id="run-1", task_id="case-1",
+        channel="active_submission", operation="history", payload=payload,
+        status="delivered",
+    )
+    records = [json.loads(line) for line in (
+        tmp_path / "runs/run-1/case-1" / JOURNAL_FILE).read_text().splitlines()]
+    assert records[-1]["provenance"] == {
+        "policy": "active_feedback_projection_v1",
+        "visibility_scope": "agent_submissions_only",
+        "source_submission_ids": ["sub-1"],
+    }
+
+
+def test_active_feedback_rejects_background_history_before_delivery(tmp_path):
+    recorder = FeedbackTransportRecorder(tmp_path)
+    exchange = recorder.request(
+        run_id="run-1", task_id="case-1", channel="active_submission",
+        operation="history", payload={},
+    )
+    with pytest.raises(ValueError, match="non-agent evidence"):
+        recorder.response(
+            exchange_id=exchange, run_id="run-1", task_id="case-1",
+            channel="active_submission", operation="history",
+            payload={"entries": [{"round": "auto-1",
+                                   "submission_id": "background-1"}]},
+            status="delivered",
+        )
 
 
 def test_concurrent_feedback_records_keep_unique_monotonic_sequence(tmp_path):
