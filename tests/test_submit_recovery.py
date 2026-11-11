@@ -214,6 +214,57 @@ def test_relay_journals_submission_ack_and_feedback_delivery_without_content(jud
     })
 
 
+def test_hidden_background_evaluation_keeps_active_recovery_agent_only(judge):
+    submitted = judge.run()
+    assert submitted.returncode == 0, submitted.stderr
+    sid = accepted_id(judge)
+
+    judge.grade_started.clear()
+    judge.grade_release.clear()
+    try:
+        background = judge.state.submit(
+            "example", b"hidden background candidate", "run", "auto-1",
+        )
+        assert judge.grade_started.wait(timeout=5)
+
+        base = f"{judge.url}/api/v1/feedback/{judge.relay_id}"
+        history_response = judge.http.get(base + "/history", timeout=5)
+        assert history_response.status_code == 200
+        history = history_response.json()
+        assert "auto_submissions" not in history
+        assert [entry["submission_id"] for entry in history["entries"]] == [sid]
+
+        listed = judge.run("--json", "--list")
+        assert listed.returncode == 0, listed.stderr
+        assert [entry["submission_id"] for entry in json.loads(listed.stdout)["entries"]] == [sid]
+
+        recovered = judge.run("--json", "--result", sid, "--no-wait")
+        assert recovered.returncode == 0, recovered.stderr
+        assert json.loads(recovered.stdout)["submission_id"] == sid
+
+        hidden = judge.http.get(base + f"/result/{background}", timeout=5)
+        assert hidden.status_code == 404
+
+        transport = (
+            judge.state.config.log_dir / "runs/run/example" / JOURNAL_FILE
+        )
+        records = [json.loads(line) for line in transport.read_text().splitlines()]
+        delivered_history = [
+            record for record in records
+            if record["operation"] == "history"
+            and record["record_kind"] == "response"
+            and record["status"] == "delivered"
+        ]
+        assert delivered_history
+        assert all(record["provenance"] == {
+            "policy": "active_feedback_projection_v1",
+            "visibility_scope": "agent_submissions_only",
+            "source_submission_ids": [sid],
+        } for record in delivered_history)
+    finally:
+        judge.grade_release.set()
+
+
 def test_read_result_preserves_full_feedback_and_submission_opportunity(judge):
     submitted = judge.run()
     assert submitted.returncode == 0, submitted.stderr

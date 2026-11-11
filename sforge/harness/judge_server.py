@@ -1228,7 +1228,6 @@ class JudgeState:
             "agent_submissions": sum(
                 1 for entry in agent_entries if entry.get("type") == "submission"
             ),
-            "auto_submissions": 0,
             "agent_submission_availability": availability,
             "entries": agent_entries,
         }
