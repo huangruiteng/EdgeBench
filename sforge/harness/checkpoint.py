@@ -259,6 +259,10 @@ class JudgeCheckpoints:
                     result["report"],
                     result["error"],
                     status,
+                    submitted_at=result.get("submitted_at"),
+                    evaluation_started_at=result.get("evaluation_started_at"),
+                    evaluation_completed_at=result.get("evaluation_completed_at"),
+                    archive_sha256=result.get("archive_sha256"),
                 )
             ):
                 raise CheckpointUnavailable(
@@ -350,9 +354,17 @@ class JudgeCheckpoints:
                 results[entry["submission_id"]] = {
                     key: result[key] for key in ("status", "report", "error")
                 }
-                # Preserve optional accepted-archive identity across remapped
-                # lookup IDs, without inventing it for older capsules.
-                for key in ("archive_sha256", "archive_bytes"):
+                # Preserve optional timing and accepted-archive evidence across
+                # remapped lookup IDs, without inventing it for older capsules.
+                # History and result readback remain two strict views of the
+                # same released evaluation.
+                for key in (
+                    "submitted_at",
+                    "evaluation_started_at",
+                    "evaluation_completed_at",
+                    "archive_sha256",
+                    "archive_bytes",
+                ):
                     if key in result:
                         results[entry["submission_id"]][key] = result[key]
             observed = time.time()

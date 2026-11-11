@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from types import SimpleNamespace
@@ -128,6 +129,14 @@ def test_failed_submission_remains_identifiable_and_next_submission_runs(tmp_pat
         assert "score" not in entries[failed_id]
         assert "valid" not in entries[failed_id]
         assert entries[good_id]["score"] == 7.0
+        for submission_id in (failed_id, good_id):
+            entry = entries[submission_id]
+            assert (
+                entry["submitted_at"]
+                <= entry["evaluation_started_at"]
+                <= entry["evaluation_completed_at"]
+            )
+            assert entry["archive_sha256"] == hashlib.sha256(b"").hexdigest()
         assert history["best_score"] == 7.0
         assert history["best_round"] == "agent-2"
         assert len(backend.cleaned) == 2

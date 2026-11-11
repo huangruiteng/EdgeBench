@@ -944,6 +944,11 @@ def cmd_qualify_attestation(args):
     print(json.dumps(receipt, indent=2, ensure_ascii=False))
     if args.require_qualified and not receipt["runtime_qualified"]:
         sys.exit(1)
+    if (
+        args.require_benchmark_integrity
+        and not receipt["benchmark_integrity_qualified"]
+    ):
+        sys.exit(1)
 
 
 def cmd_fetch_tasks(args):
@@ -1170,6 +1175,11 @@ def main():
     p_qualification.add_argument("--expected-task-id", required=True)
     p_qualification.add_argument("--expected-source-revision", required=True)
     p_qualification.add_argument("--require-qualified", action="store_true")
+    p_qualification.add_argument(
+        "--require-benchmark-integrity",
+        action="store_true",
+        help="Fail unless the signed runner-owned benchmark integrity artifact qualifies",
+    )
     p_qualification.set_defaults(func=cmd_qualify_attestation)
 
     # list
